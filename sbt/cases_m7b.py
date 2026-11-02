@@ -83,8 +83,26 @@ def run_cases() -> list[dict]:
             out.append({"name": "%s finite" % name, "asm": asm + "\nret", "v": True, "vregs": vregs(FINITE_S, 32, 1)})
     return out + [{"name": name, "asm": asm + "\nret", "v": True, "vregs": {**GARBAGE, **v}} for name, asm, v in CROSS]
 
+def wide_cases() -> list[dict]:
+    """Independent FP ops wide enough for SLP to pack 4-8 lanes into one YMM register, with one NaN row: the cold path's calls
+    run while the other rows' results stay live in that YMM register (a preserve_all helper's vzeroupper zeroed them)."""
+    out = []
+    fin_d = [0x3FF0000000000000, 0x4000000000000000, 0xBFE0000000000000, 0x400921FB54442D18]
+    for (w, vals, fin), op, k in itertools.product((("s", S, FINITE_S), ("d", D, fin_d)), ("fadd", "fmul", "fdiv", "fsqrt"), range(4)):
+        regs = {r: (fin[(r + k) % len(fin)], 0) for r in range(30)}
+        regs[3 * k + 1] = (vals[k], 0)                                 # row k's first source is a NaN or another special value
+        src = "%s %s{d}, %s{a}" % (op, w, w) if op == "fsqrt" else "%s %s{d}, %s{a}, %s{b}" % (op, w, w, w)
+        asm = "\n".join(src.format(d=3 * j, a=3 * j + 1, b=3 * j + 2) for j in range(10))
+        out.append({"name": "wide %s %s #%d" % (op, w, k), "asm": asm + "\nret", "v": True, "vregs": {**GARBAGE, **regs}})
+    for op, k in itertools.product(("fadd", "fmul", "fdiv"), range(4)):
+        regs = {r: pack(lanes(fin_d, r, 2), 64) for r in range(16)}
+        regs[2 * k + 1] = pack([D[k], fin_d[0]], 64)                    # one NaN or special lane
+        asm = "\n".join("%s v%d.2d, v%d.2d, v%d.2d" % (op, 16 + j, 2 * j, 2 * j + 1) for j in range(8))
+        out.append({"name": "wide %s 2d #%d" % (op, k), "asm": asm + "\nret", "v": True, "vregs": {**GARBAGE, **regs}})
+    return out
+
 ###############
 # cases
 ###############
-CASES = run_cases() + scalar_cases()
+CASES = run_cases() + scalar_cases() + wide_cases()
 print("cases_m7b: %d cases" % len(CASES))

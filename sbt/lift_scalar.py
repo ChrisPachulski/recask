@@ -44,13 +44,13 @@ static inline T s_dn##N(T r){return s_isnan##N(r)?((T)EXPM|(T)QB):r;} \
 static inline int s_nan2_##N(T a,T b,T*r){ \
   if(s_issnan##N(a)){*r=a|(T)QB;return 1;} if(s_issnan##N(b)){*r=b|(T)QB;return 1;} \
   if(s_isnan##N(a)){*r=a;return 1;} if(s_isnan##N(b)){*r=b;return 1;} return 0;} \
-static __attribute__((noinline,cold,preserve_all)) F s_nanbin##N(F fa,F fb,F q){ \
+static __attribute__((noinline,cold)) F s_nanbin##N(F fa,F fb,F q){ \
   T a=s_fu##N(fa), b=s_fu##N(fb), r;if(s_nan2_##N(a,b,&r))return s_tf##N(r);return s_tf##N(s_dn##N(s_fu##N(q)));} \
 static inline T s_fmul##N(T a,T b){F x=s_tf##N(a),y=s_tf##N(b),q=x*y; if(__builtin_expect(q!=q,0))q=s_nanbin##N(x,y,q); return s_fu##N(q);} \
 static inline T s_fsub##N(T a,T b){F x=s_tf##N(a),y=s_tf##N(b),q=x-y; if(__builtin_expect(q!=q,0))q=s_nanbin##N(x,y,q); return s_fu##N(q);} \
 static inline T s_fadd##N(T a,T b){F x=s_tf##N(a),y=s_tf##N(b),q=x+y; if(__builtin_expect(q!=q,0))q=s_nanbin##N(x,y,q); return s_fu##N(q);} \
 static inline T s_fdiv##N(T a,T b){F x=s_tf##N(a),y=s_tf##N(b),q=x/y; if(__builtin_expect(q!=q,0))q=s_nanbin##N(x,y,q); return s_fu##N(q);} \
-static __attribute__((noinline,cold,preserve_all)) F s_nanfma##N(F fa,F fn,F fm){ \
+static __attribute__((noinline,cold)) F s_nanfma##N(F fa,F fn,F fm){ \
   T a=s_fu##N(fa), n=s_fu##N(fn), m=s_fu##N(fm); \
   T an=n&~(T)SG, am=m&~(T)SG; int iz=(an==(T)EXPM&&am==0)||(an==0&&am==(T)EXPM); \
   if(iz&&s_isqnan##N(a))return s_tf##N((T)EXPM|(T)QB); \
@@ -59,7 +59,7 @@ static __attribute__((noinline,cold,preserve_all)) F s_nanfma##N(F fa,F fn,F fm)
   return s_tf##N(s_dn##N(s_fu##N(FMA(s_tf##N(n),s_tf##N(m),s_tf##N(a)))));} \
 static inline T s_fma##N(T a,T n,T m){ \
   F x=s_tf##N(a),y=s_tf##N(n),z=s_tf##N(m),q=FMA(y,z,x); if(__builtin_expect(q!=q,0))q=s_nanfma##N(x,y,z); return s_fu##N(q);} \
-static __attribute__((noinline,cold,preserve_all)) F s_nansqrt##N(F fa){ \
+static __attribute__((noinline,cold)) F s_nansqrt##N(F fa){ \
   T a=s_fu##N(fa); if(s_isnan##N(a))return s_tf##N(a|(T)QB); if((a&(T)SG)&&(a&~(T)SG))return s_tf##N((T)EXPM|(T)QB); return SQRT(fa);} \
 static inline T s_sqrt##N(T a){F x=s_tf##N(a),q=SQRT(x); if(__builtin_expect(q!=q,0))q=s_nansqrt##N(x); return s_fu##N(q);} \
 static inline T s_maxnm##N(T a,T b,int mn){ \
@@ -69,16 +69,16 @@ static inline T s_maxnm##N(T a,T b,int mn){ \
   F x=s_tf##N(a), y=s_tf##N(b); \
   if(x==y)return mn?(a|b):(a&b); \
   return mn?(x<y?a:b):(x>y?a:b);} \
-static __attribute__((noinline,cold,preserve_all)) F s_nanq##N(F fa){return s_tf##N(s_fu##N(fa)|(T)QB);} \
+static __attribute__((noinline,cold)) F s_nanq##N(F fa){return s_tf##N(s_fu##N(fa)|(T)QB);} \
 static inline T s_frint##N(T a,int md){ \
   F x=s_tf##N(a),q=md==0?RND(x):md==1?FLR(x):CEIL(x); if(__builtin_expect(q!=q,0))q=s_nanq##N(x); return s_fu##N(q);}
 S_GEN(32,uint32_t,float,0x80000000u,0x7f800000u,0x00400000u,fmaf,sqrtf,roundf,floorf,ceilf)
 S_GEN(64,uint64_t,double,0x8000000000000000ULL,0x7ff0000000000000ULL,0x0008000000000000ULL,fma,sqrt,round,floor,ceil)
-static __attribute__((noinline,cold,preserve_all)) double s_nancvt_sd(float f){
+static __attribute__((noinline,cold)) double s_nancvt_sd(float f){
   uint32_t a=s_fu32(f); return s_tf64(((uint64_t)(a>>31)<<63)|0x7ff8000000000000ULL|((uint64_t)(a&0x7fffffu)<<29));}
 static inline uint64_t s_cvt_sd(uint32_t a){
   float x=s_tf32(a); double q=(double)x; if(__builtin_expect(q!=q,0))q=s_nancvt_sd(x); return s_fu64(q);}
-static __attribute__((noinline,cold,preserve_all)) float s_nancvt_ds(double f){
+static __attribute__((noinline,cold)) float s_nancvt_ds(double f){
   uint64_t a=s_fu64(f); return s_tf32(((uint32_t)(a>>63)<<31)|0x7fc00000u|(uint32_t)((a>>29)&0x7fffffu));}
 static inline uint32_t s_cvt_ds(uint64_t a){
   double x=s_tf64(a); float q=(float)x; if(__builtin_expect(q!=q,0))q=s_nancvt_ds(x); return s_fu32(q);}

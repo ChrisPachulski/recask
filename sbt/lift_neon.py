@@ -138,7 +138,7 @@ static inline T n_frsqrts##S(T a,T b){if((isinf(a)&&b==0)||(a==0&&isinf(b)))retu
 N_FP(32,float,uint32_t,f,0x400000u,0x7fc00000u,0x80000000u)
 N_FP(64,double,uint64_t,,0x8000000000000ULL,0x7ff8000000000000ULL,0x8000000000000000ULL)
 #define N_FIXV(S,VT,OP,E) \
-static __attribute__((noinline,cold,preserve_all)) VT n_fixv_##OP##S(VT a,VT b,VT d,VT r,int n){for(int j=0;j<n;j++)r[j]=E;(void)d;return r;}
+static __attribute__((noinline,cold)) VT n_fixv_##OP##S(VT a,VT b,VT d,VT r,int n){for(int j=0;j<n;j++)r[j]=E;(void)d;return r;}
 #define N_FIXALL(S,VT) N_FIXV(S,VT,fadd,n_fadd##S(a[j],b[j])) N_FIXV(S,VT,fsub,n_fsub##S(a[j],b[j])) N_FIXV(S,VT,fmul,n_fmul##S(a[j],b[j])) \
   N_FIXV(S,VT,fdiv,n_fdiv##S(a[j],b[j])) N_FIXV(S,VT,fmla,n_fma##S(d[j],a[j],b[j])) N_FIXV(S,VT,fmls,n_fma##S(d[j],n_fneg##S(a[j]),b[j]))
 N_FIXALL(32,gv4f)
@@ -329,7 +329,7 @@ def lift_elem(ins: object, m: str, ops: list) -> str:
         fast = ["_r.%s=%s;" % (vt, FAST[m].format(**ops_v)),
                 "%s _m=_r.%s!=_r.%s;" % ("gv4i" if e == 32 else "gv2l", vt, vt)]
         any_nan = "__builtin_ia32_movmsk%s((%s)_m) & %d" % ("ps" if e == 32 else "pd", "gv4f" if e == 32 else "gv2d", (1 << n) - 1)   # lane sign bits: one test
-        fix = "_r.%s=n_fixv_%s%d(_a.%s,%s,_d.%s,_r.%s,%d);" % (vt, m, e, vt, bv, vt, vt, n)   # the per-lane ARM results, out of line: preserve_all keeps the hot path's registers
+        fix = "_r.%s=n_fixv_%s%d(_a.%s,%s,_d.%s,_r.%s,%d);" % (vt, m, e, vt, bv, vt, vt, n)   # the per-lane ARM results, out of line, plain C convention (preserve_all's vzeroupper clears live YMM uppers)
         body = fast + ["if (__builtin_expect((%s)!=0, 0)) { %s }" % (any_nan, fix)]
     elif m in VINT and not half and not (b and b[4] >= 0) and (b or "{b}" not in VINT[m]):   # whole-vector integer lanes
         vu = VU[e]
