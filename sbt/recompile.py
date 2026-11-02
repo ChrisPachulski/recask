@@ -63,6 +63,7 @@ LANE_WRITE = re.compile(r"\b(gr_v\d+)\.(u8|u16|u32|u64|f32|f64|v\w+)(?:\[(\d+)\]
 LANE_BYTES = {"u8": 1, "u16": 2, "u32": 4, "u64": 8, "f32": 4, "f64": 8}
 ABI_CS = sum(1 << LOCAL_BIT[n] for n in ["gr_x%d" % i for i in range(19, 29)] + ["gr_v%d" % i for i in range(8, 16)])   # callee-saved
 ABI_EXTRA = ABI_NOT_IN | ABI_CS                                        # what a call under the contract does not pass
+CS_ORDER = [LOCAL_BIT[n] for n in ["gr_x%d" % i for i in range(19, 29)] + ["gr_v%d" % i for i in range(8, 16)]]   # gdyld GDA_O_ bit k: CS_ORDER[k]
 SAVE_OPS = {"stp", "stnp", "str", "stur"}                              # stores that can be a prologue save
 CSE_KEEP = "!GD_ABI || !defined(GD_CSE) || defined(GDA_K_%x)"          # an unread prologue save stays (saved_reads; gdyld GD_CSE, GDA_K_)
 NARROW_ACCESS = {"ldrb": 1, "ldurb": 1, "ldrsb": 1, "ldursb": 1, "ldrh": 2, "ldurh": 2, "ldrsh": 2, "ldursh": 2, "ldrsw": 4,
@@ -1075,6 +1076,10 @@ def prune_spills(edges: list, writes: list[int], entries: list[int], spills: dic
         if m: out[(p, h)] = m
     return out
 
+def cs_compact(mask: int) -> int:
+    """The callee-saved registers of a LOCAL_BIT mask as gdyld's GDA_O_ value (bit k: CS_ORDER[k])."""
+    return sum(1 << k for k, b in enumerate(CS_ORDER) if mask >> b & 1)
+
 def abi_split(mask: int, keep: int, fwrap: str, split: bool, cond: str = "!GD_ABI") -> str:
     """spill_of(mask, fwrap), with the stores outside keep only under the preprocessor condition cond when split (the image runs under the AAPCS64 register contract only when gdyld's header says GD_ABI 1)."""
     if not split or not mask & ~keep: return spill_of(mask, fwrap)
@@ -1105,7 +1110,7 @@ def saved_by(ins: object, d: int | None) -> int:
 
 def abi_check(parts: list[tuple[int, str]], edges: list, entries: list[int], insns: list, fstarts: set,
               noret: frozenset = frozenset(), brt: dict | None = None, sites: dict | None = None, blind: frozenset = frozenset()) -> tuple[dict, tuple]:
-    """({index of a direct call: mask of the ABI_NOT_OUT registers read after it}: the site reloads them all and the callee keeps every store at its returns, gdyld GDA_RET_<callee>; compiled code does this for an undefined value or a callee with its own convention, (reads, writes, calls), the unread prologue saves (saved_reads; none when a call is read past)): what gdyld abi_plan closes over the image's calls to tell which functions break the AAPCS64 register contract GD_ABI relies on, as machine-outlined bodies do: reads, the ABI_EXTRA registers live at the entry (read before written) or whose entry values a load takes back from their save slots (saved_reads); writes, the callee-saved registers written where no prologue save (saved_by, stored below the entry sp on every path there) came first; calls, [(sites[index], ABI_EXTRA registers that may still hold their entry values there and are not yet saved (owned), callee-saved registers saved on every path there)] per reached call or tail call site (sites: index -> ('d', callee) or ('g', GOT vmaddr)). Backward liveness over the lifted text (parts with locals): a read is a mention that is not an assignment (lift_neon's unused _d copy is none), a prologue save, or of a callee-saved register already saved on every path there (the function owns it; its reads past correlated branches the liveness cannot follow are its own), a text without `if (` kills what it assigns whole (a V register: all 16 bytes of its lanes), a call kills ABI_CLOBBER (what it reads is the callee's own entry check), a direct call into noret has no successor, and an exit or br keeps the results live (a br reaches its own decoded table's targets (brt: index -> target indices; else every case but the function start, a tail call that sets its own arguments), and an undecoded one (blind) has no successor here: a compiled jump table's targets read only what is defined at the br, never an entry value of ABI_EXTRA registers, and write callee-saved registers only after the prologue saves before it, while its edges to every word make every register look live and every save look skipped); a callee-saved register is not live at an exit, its value is not read there."""
+    """({index of a direct call: mask of the ABI_NOT_OUT registers read after it}: the site reloads them all and the callee keeps every store at its returns, gdyld GDA_RET_<callee>; compiled code does this for an undefined value or a callee with its own convention, (reads, writes, calls, flat: no text sets x29, a frame record, and no branch lands inside the function but a closing br, the outliner's tail call through a register; the shape of a machine-outlined body), the unread prologue saves (saved_reads; none when a call is read past)): what gdyld abi_plan closes over the image's calls to tell which functions break the AAPCS64 register contract GD_ABI relies on, as machine-outlined bodies do: reads, the ABI_EXTRA registers live at the entry (read before written) or whose entry values a load takes back from their save slots (saved_reads); writes, the callee-saved registers written where no prologue save (saved_by, stored below the entry sp on every path there) came first; calls, [(sites[index], ABI_EXTRA registers that may still hold their entry values there and are not yet saved (owned), callee-saved registers saved on every path there)] per reached call or tail call site (sites: index -> ('d', callee) or ('g', GOT vmaddr)). Backward liveness over the lifted text (parts with locals): a read is a mention that is not an assignment (lift_neon's unused _d copy is none), a prologue save, or of a callee-saved register already saved on every path there (the function owns it; its reads past correlated branches the liveness cannot follow are its own), a text without `if (` kills what it assigns whole (a V register: all 16 bytes of its lanes), a call kills ABI_CLOBBER (what it reads is the callee's own entry check), a direct call into noret has no successor, and an exit or br keeps the results live (a br reaches its own decoded table's targets (brt: index -> target indices; else every case but the function start, a tail call that sets its own arguments), and an undecoded one (blind) has no successor here: a compiled jump table's targets read only what is defined at the br, never an entry value of ABI_EXTRA registers, and write callee-saved registers only after the prologue saves before it, while its edges to every word make every register look live and every save look skipped); a callee-saved register is not live at an exit, its value is not read there. Limits (tests/adv abi_brx, abi_psv): the call sites past an undecoded br are not in calls, so a callee breaking the contract there gives this function no RET or keep (the compiled jump tables found call only functions that keep it); and a read of a callee-saved register after its prologue save is not counted though it may still hold the entry value (a getter that saves x19 and returns it; compiled code reads a saved register only after writing it)."""
     n, texts = len(edges), {}
     for i, t in parts:
         if i >= 0: texts[i] = texts.get(i, "") + t + "\n"
@@ -1173,7 +1178,8 @@ def abi_check(parts: list[tuple[int, str]], edges: list, entries: list[int], ins
         if saved[i] is not None: wrote |= anyw[i] & ABI_CS & ~saved[i]
     calls = [(r, entry[i] & ABI_EXTRA & ~saved[i], saved[i]) for i, r in sorted((sites or {}).items()) if saved[i] is not None]
     unread, back = saved_reads(insns, succs, preds, entries, spd, sv, anyw, kl, raw, flow)
-    return late, (live[0] & ABI_EXTRA | back, wrote, calls), ({} if late else unread)
+    flat = not any(w >> LOCAL_BIT["gr_x29"] & 1 for w in anyw) and all(s == k + 1 for k, (succ, _c) in enumerate(edges) for s in succ if k + 1 < n or insns[k].mnemonic != "br")   # gdyld outlined_bodies
+    return late, (live[0] & ABI_EXTRA | back, wrote, calls, flat), ({} if late else unread)
 
 def saved_reads(insns: list, succs: list, preds: list, entries: list[int], spd: list, sv: list, anyw: list, kl: list, raw: list,
                 flow: object) -> tuple[dict[int, int], int]:
@@ -1244,8 +1250,8 @@ def saved_reads(insns: list, succs: list, preds: list, entries: list[int], spd: 
             if held[j] >> k & 1 and (r is None or a < r[1] and r[0] < e): read |= b; used.add(i)
     return ({} if entries[1:] else {i: sv[i] for i, _b, _a, _e in slots if i not in used}), read
 
-def place_edge_spills(parts: list[tuple[int, str]], spills: dict, insns: list, split: bool = False) -> list[tuple[int, str]]:
-    """parts with each loop_entry_spills store placed on its edge: inside the predecessor's `goto L_<head>;` and after its last part when it falls into the head (split: abi_split against ABI_IN)."""
+def place_edge_spills(parts: list[tuple[int, str]], spills: dict, insns: list, split: bool = False, cond: str = "!GD_ABI") -> list[tuple[int, str]]:
+    """parts with each loop_entry_spills store placed on its edge: inside the predecessor's `goto L_<head>;` and after its last part when it falls into the head (split: abi_split against ABI_IN, the rest under cond)."""
     by_pred = {}
     for (p, h), m in spills.items(): by_pred.setdefault(p, []).append((h, m))
     last_part = {n: k for k, (n, _t) in enumerate(parts) if n >= 0}
@@ -1253,16 +1259,16 @@ def place_edge_spills(parts: list[tuple[int, str]], spills: dict, insns: list, s
     for k, (n, t) in enumerate(parts):
         for h, m in by_pred.get(n, []):
             go = "goto L_%x;" % insns[h].address
-            t = t.replace(go, "{ %s%s }" % (abi_split(m, ABI_IN, "", split), go))
+            t = t.replace(go, "{ %s%s }" % (abi_split(m, ABI_IN, "", split, cond), go))
         out.append((n, t))
         if n >= 0 and last_part[n] == k:
-            out += [(n, "  " + abi_split(m, ABI_IN, "", split)) for h, m in by_pred.get(n, []) if h == n + 1 and insns[n].mnemonic not in NO_FALL]
+            out += [(n, "  " + abi_split(m, ABI_IN, "", split, cond)) for h, m in by_pred.get(n, []) if h == n + 1 and insns[n].mnemonic not in NO_FALL]
     return out
 
 def localize(parts: list[tuple[int, str]], edges: list, entries: list[int], regs: bool, insns: list, fstarts: set,
              blind: frozenset = frozenset(), abi: bool = False, noret: frozenset = frozenset(), brt: dict | None = None,
              sites: dict | None = None) -> tuple[str, str, dict | None]:
-    """(body, entry declarations, flag_facts) from (instruction index or -1, text) parts with SPILL / RELOAD / TAIL markers. regs: the guest registers, NZCV and V registers the text names become C locals; each SPILL (and each return) stores only the locals that may be dirty there (dirty_in, plus what the instruction itself wrote), its NZCV stores under the site's flag_wrap guard, each RELOAD reloads them all; else the text keeps c-> (the CPU struct is always current) and the markers vanish (flag_facts as for regs: what the function's callers and callees owe it). abi: the image may run under the AAPCS64 register contract (gdyld GD_ABI): the facts get 'abi_late' and 'abi_fn' (abi_check), and in a function with one entry the stores and reloads the contract makes unneeded go under !GD_ABI: a call stores ABI_IN, a return ABI_OUT, a reload after a call takes ABI_BACK (callee-saved registers keep their locals; caller-saved ones are undefined). A call site (sites: index -> ('d', callee) or ('g', GOT vmaddr)) also stores and reloads everything when gdyld finds its callee breaks the contract (GDA_X_<callee>, GDA_G_<GOT>), and a direct call abi_check finds read after always does (gdyld makes the callee's returns and tail calls store everything: GDA_RET_<callee>). Functions with resume points or extra entries keep every store and reload: the guest unwinder, setjmp and a return past a host call site read the CPU struct."""
+    """(body, entry declarations, flag_facts) from (instruction index or -1, text) parts with SPILL / RELOAD / TAIL markers. regs: the guest registers, NZCV and V registers the text names become C locals; each SPILL (and each return) stores only the locals that may be dirty there (dirty_in, plus what the instruction itself wrote), its NZCV stores under the site's flag_wrap guard, each RELOAD reloads them all; else the text keeps c-> (the CPU struct is always current) and the markers vanish (flag_facts as for regs: what the function's callers and callees owe it). abi: the image may run under the AAPCS64 register contract (gdyld GD_ABI): the facts get 'abi_late' and 'abi_fn' (abi_check), and in a function with one entry the stores and reloads the contract makes unneeded go under !GD_ABI: a call stores ABI_IN, a return ABI_OUT, a reload after a call takes ABI_BACK (callee-saved registers keep their locals; caller-saved ones are undefined). A call site (sites: index -> ('d', callee) or ('g', GOT vmaddr)) also stores everything and reloads every caller-saved register when gdyld finds its callee breaks the contract or is a machine-outlined body (GDA_X_<callee>, GDA_G_<GOT>), and a direct call abi_check finds read after always does, its callee-saved registers aside (gdyld makes the callee's returns and tail calls store everything: GDA_RET_<callee>); a call reloads a callee-saved register only where its callee may leave it changed (GDA_O_<callee or GOT>, bit k for CS_ORDER[k]: gdyld abi_plan). A loop-entry edge store in a function with such a site or such returns (GDA_K_) stores everything too: a register set before the loop may reach one of them unchanged. Such a function, whose prologue saves stay (CSE_KEEP), also stores its dirty callee-saved registers at each return and tail call, which then hold its caller's values again: a caller that keeps guest state in the CPU struct (no locals: a HUGE_SWITCH function) reads its callee-saved registers there after the call, so no call may return with another function's values in them (sqlite3's yy_reduce over a by-shape outlined body's caller, sqlite3VdbeExec, in strip -x of the spread's sqlite3). Functions with resume points or extra entries keep every store and reload: the guest unwinder, setjmp and a return past a host call site read the CPU struct."""
     parts = [(n, t.replace("return;", "GD_SPILLR return;") if "return;" in t else t) for n, t in parts]   # every exit but a tail call's
     lparts = [(n, REG_REF.sub(local_of, t.replace("flags_add(c, ", "flags_add_l(&c->NF,&c->ZF,&c->CF,&c->VF, "))
                    .replace("GD_SPW;", "c->SP=gr_sp; GD_SIGF;")) for n, t in parts]
@@ -1281,25 +1287,34 @@ def localize(parts: list[tuple[int, str]], edges: list, entries: list[int], regs
     din = dirty_in(edges, writes, entries, keep=keep)
     spills = prune_spills(edges, writes, entries, loop_entry_spills(edges, writes, din, texts, insns), keep, split)
     if spills:
-        parts = place_edge_spills(parts, spills, insns, split)
+        parts = place_edge_spills(parts, spills, insns, split, "!GD_ABI || defined(GDA_K_%x)" % insns[0].address)
         din = dirty_in(edges, writes, entries, spills, keep)
     used = mask_of(n for _n, t in parts for n in LOCAL_NAME.findall(t))
     names = [n for k, n in enumerate(LOCAL_AT) if used >> k & 1]
     reload = " " + "".join("%s=%s; " % (n, field_of(n)) for n in names if not split or ABI_BACK >> LOCAL_BIT[n] & 1)
-    rest = "".join("%s=%s; " % (n, field_of(n)) for n in names if split and not ABI_BACK >> LOCAL_BIT[n] & 1)
-    reload_of = lambda sc: reload + ("\n#if !GD_ABI%s\n%s\n#endif\n" % (sc, rest) if rest else "")
+    rest = "".join("%s=%s; " % (n, field_of(n)) for n in names if split and not (ABI_BACK | ABI_CS) >> LOCAL_BIT[n] & 1)
+    cs = [n for n in names if split and ABI_CS >> LOCAL_BIT[n] & 1]
+    def cs_of(n: int) -> str:                                          # a callee-saved register reloads only where its callee may leave it changed
+        if not cs: return ""
+        if n not in (sites or {}): return "\n#if !GD_ABI\n%s\n#endif\n" % "".join("%s=%s; " % (r, field_of(r)) for r in cs)
+        return "".join("\n#if !GD_ABI || (GDA_O_%x >> %d & 1)\n%s=%s;\n#endif\n" % (sites[n][1], CS_ORDER.index(LOCAL_BIT[r]), r, field_of(r)) for r in cs)
+    reload_of = lambda n, sc: reload + ("\n#if !GD_ABI%s\n%s\n#endif\n" % (sc, rest) if rest else "") + cs_of(n)
     site = {i: " || defined(GDA_%s_%x)" % ("X" if r[0] == "d" else "G", r[1]) for i, r in (sites or {}).items()}   # its callee breaks the contract
     full = " " + "".join("%s=%s; " % (n, field_of(n)) for n in names)
+    late_of = lambda n: reload + rest + cs_of(n) if split else full
     back = "!GD_ABI || defined(GDA_RET_%x)" % insns[0].address         # this function's callers read registers past its results
+    own = "GD_ABI && defined(GDA_K_%x)" % insns[0].address             # this function may leave its callee-saved registers in the CPU struct
+    exit_cs = lambda mask: "\n#if %s\n%s\n#endif\n" % (own, spill_of(mask & ABI_CS, "")) if split and mask & ABI_CS else ""
     facts = {**flag_facts(parts, edges, entries, insns, fstarts, blind), **why}
     start = insns[0].address
     body = []
     for n, t in parts:
         if "GD_SPILL" in t:
             mask = every if n < 0 or din[n] is None else din[n] | writes[n]
-            t = SPILL_MARK.sub(lambda m: abi_split(mask, ABI_OUT if m.group(1) == "R" else ABI_IN, flag_wrap(m.group(1) or "", start),
-                                                   split and n not in late, (back if m.group(1) == "R" or TAIL in t else "!GD_ABI") + site.get(n, "")), t)
-        body.append(t.replace(RELOAD, full if n in late else reload_of(site.get(n, ""))).replace(TAIL, "return;") if "GD_" in t else t)
+            t = SPILL_MARK.sub(lambda m: abi_split(mask, ABI_OUT if m.group(1) == "R" else ~ABI_CS if n in late else ABI_IN, flag_wrap(m.group(1) or "", start),
+                                                   split, (back if m.group(1) == "R" or TAIL in t else "!GD_ABI") + site.get(n, ""))
+                               + (exit_cs(mask) if m.group(1) == "R" or TAIL in t else ""), t)
+        body.append(t.replace(RELOAD, late_of(n) if n in late else reload_of(n, site.get(n, ""))).replace(TAIL, "return;") if "GD_" in t else t)
     return "\n".join(body), "".join("  %s %s=%s;\n" % (local_type(n), n, field_of(n)) for n in names), facts
 
 def cs_keep(t: str, mask: int, start: int) -> str:

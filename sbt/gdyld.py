@@ -32,12 +32,17 @@ LIBSYSTEM, LIBUNWIND = "/usr/lib/libSystem.B.dylib", "/usr/lib/libunwind.1.dylib
 INTRINSICS = {LIBUNWIND: {"___libunwind_Registers_arm64_jumpto": "gd_jumpto"}}      # image id -> {local symbol: host function}
 SETJMP = {"_setjmp", "__setjmp", "_sigsetjmp"}                         # their return sites become resume points
 FULL_SPILL = {"___chkstk_darwin"}                                      # host routines reading past the arguments (sp_chkstk: x9): GDA_G_
+NORETURN = {"___stack_chk_fail", "_abort", "_exit", "__exit", "__Exit", "_quick_exit", "___assert_rtn", "_longjmp", "_siglongjmp", "__longjmp",
+            "___cxa_throw", "___cxa_rethrow", "___cxa_bad_cast", "___cxa_bad_typeid", "___cxa_throw_bad_array_new_length",
+            "___cxa_call_unexpected", "___cxa_pure_virtual", "___cxa_deleted_virtual", "__Unwind_Resume", "__ZSt9terminatev",
+            "_objc_exception_throw", "_objc_exception_rethrow", "_objc_terminate", "_pthread_exit", "_err", "_errx", "_verr", "_verrx"}   # imports that never return
+OUTLINED = "_OUTLINED_FUNCTION_"                                       # the machine outliner's local symbols (gdyld outlined_bodies)
 MSG_SENDS = {"_objc_msgSend": 0, "_objc_msgSendSuper": 1, "_objc_msgSendSuper2": 2}   # recompile GD_MSGSEND kinds (gobjc send's sup)
 CHUNK_INSNS = 6000                                                     # instructions per compiled C chunk (bounds clang RSS)
 FUNC_RE = re.compile(r"\bfunc_([0-9a-f]+)\b")                          # a lifted function's C name in chunk source
 OPTNONE_CASES = 256                                                    # ponytail: -O0 for undecoded-br functions; decode their tables if hot
 FLAT_O2_CASES = 8192                                                   # a c->-state switch this size compiles in ~10 s at -O2; 45k cases took >10 min
-LC_SYMTAB, N_TYPE, N_SECT, N_STAB = 0x2, 0x0E, 0x0E, 0xE0
+LC_SYMTAB, N_TYPE, N_SECT, N_STAB, N_EXT = 0x2, 0x0E, 0x0E, 0xE0, 0x01
 CLANG, CLANGXX = "/usr/bin/clang", "/usr/bin/clang++"
 GUEST_BASE = 0x200000000
 IMAGE_ALIGN = 0x1000000
@@ -272,6 +277,17 @@ def section_symbols(m: dict) -> dict[str, int]:
     for k in range(nsyms):
         strx, ntype, _sect, _desc, value = struct.unpack_from("<IBBHQ", m["data"], symoff + 16 * k)
         if ntype & N_TYPE == N_SECT and not ntype & N_STAB: out.setdefault(cstr(m["data"], stroff + strx), value)
+    return out
+
+def local_text_symbols(m: dict) -> list[tuple[str, int]]:
+    """LC_SYMTAB's local (not external) section symbols in code sections: (name, vmaddr); none in an image stripped of them (strip -x)."""
+    if not m["symtab"]: return []
+    symoff, nsyms, stroff, _strsize = m["symtab"]
+    code, out = code_sections(m), []
+    for k in range(nsyms):
+        strx, ntype, _sect, _desc, value = struct.unpack_from("<IBBHQ", m["data"], symoff + 16 * k)
+        if ntype & N_TYPE == N_SECT and not ntype & (N_STAB | N_EXT) and any(a <= value < a + size for a, size, _o in code):
+            out.append((cstr(m["data"], stroff + strx), value))
     return out
 
 def all_segments(data: bytes) -> list:
@@ -862,6 +878,18 @@ def noreturn_starts(img: dict) -> frozenset:
             if not back: out.append(lo)
     return frozenset(out)
 
+def noreturn_stubs(img: dict) -> frozenset:
+    """Import stubs whose GOT slot binds a function that never returns (NORETURN, libc++'s std::__throw_* helpers): recompile abi_check ends a path at a bl to one, as at one to noreturn_starts, so the next function's code past it does not read as this one's."""
+    bound = {a: n for a, _o, n, _w, _ad in img["binds"]}
+    named = lambda n: n in NORETURN or n.startswith(("__ZNSt3__1", "__ZNKSt3__1")) and "__throw_" in n
+    return frozenset(st for st, g in stub_gots(img).items() if named(bound.get(g, "")))
+
+def outlined_bodies(img: dict, li: dict) -> tuple[str, frozenset]:
+    """(how they were found, the starts of the image's machine-outlined bodies): by name, the OUTLINED symbols, when the image keeps local symbols; by shape in an image stripped of them, every function that sets up no frame record (Darwin's non-leaf functions all do; an outlined body saves at most lr), runs straight through (the outliner takes runs of one basic block: no branch lands inside the function, a closing br aside) and that only a direct branch reaches (not address_taken over the exact pointer_refs: no pointer, no export; an adrp whose use is not decoded covers its whole page, and an outlined body sharing that page is still one), as an outlined body is, so a small frameless leaf function counts too (recompile abi_check: flat). An outlined body has a convention of its own (gdyld abi_plan)."""
+    syms = local_text_symbols(img)
+    if syms: return "by name", frozenset(a for n, a in syms if n.startswith(OUTLINED) and a in li["abi_fn"])
+    return "by shape", frozenset(a for a, f in li["abi_fn"].items() if f[3] and a not in li["abi_named"])
+
 def abi_returns(rows: list, late: set) -> set:
     """Function starts whose returns and tail calls keep every store under GD_ABI: the direct callees some caller reads past the results of (recompile abi_check), closed over direct tail calls (an indirect or stub tail call stores everything there too, and neither host code nor a function under the contract changes the registers it does not return), from the image's flag rows ([(addresses defined, flag_facts)])."""
     tails = {ads[0]: fc.get("tails", ()) for ads, fc in rows if fc}
@@ -871,8 +899,8 @@ def abi_returns(rows: list, late: set) -> set:
         if f not in out: out.add(f); work += sorted(tails.get(f, ()))
     return out
 
-def abi_plan(images: list, lifts: list) -> list[tuple[str, set, set, set, set]]:
-    """Per image (why its code keeps full register sync, else ''; GDA_X_ callees; GDA_G_ GOT slots; GDA_RET_ functions; GDA_K_ functions: those storing every register at a return or at one of their call sites, whose prologue saves recompile saved_reads would drop stay). A function breaks the AAPCS64 register contract when it reads registers no call passes (its entry's, and a callee's that may reach the call unchanged) or leaves callee-saved registers changed (its own writes before any save, and a callee's it saved nothing over), closed over the direct calls and tail calls of each image and the stub and GOT calls between images (recompile abi_check facts; a GOT bound into guest code calls that function). A GOT call passes on only what its callee leaves changed: an export that reads registers no call passes has a convention of its own (sp_chkstk's x9) or captures its caller's registers (the unwinder's unw_getcontext), which the site honours by storing everything (GDA_G_) and which its own image's callers cannot see (an export is address_taken). Calls into one store and reload every register, and its returns store every register, as do those of the direct callees some caller reads past the results of (abi_returns). An image keeps full sync when one of its own is reached through a pointer or an export (address_taken: an indirect call cannot tell), or when abi_ok says so. The GOT slots bound to FULL_SPILL host routines are GDA_G_ too."""
+def abi_plan(images: list, lifts: list) -> list[tuple[str, set, set, set, set, dict, str]]:
+    """Per image (why its code keeps full register sync, else ''; GDA_X_ callees; GDA_G_ GOT slots; GDA_RET_ functions; GDA_K_ functions: those storing every register at a return or at one of their call sites, whose prologue saves recompile saved_reads would drop stay; GDA_O_ masks; how many machine-outlined bodies and how found). A function breaks the AAPCS64 register contract when it reads registers no call passes (its entry's, and a callee's that may reach the call unchanged) or leaves callee-saved registers changed (its own writes before any save, and a callee's it saved nothing over), closed over the direct calls and tail calls of each image and the stub and GOT calls between images (recompile abi_check facts; a GOT bound into guest code calls that function). A GOT call passes on only what its callee leaves changed: an export that reads registers no call passes has a convention of its own (sp_chkstk's x9) or captures its caller's registers (the unwinder's unw_getcontext), which the site honours by storing everything (GDA_G_) and which its own image's callers cannot see (an export is address_taken). Calls into one store every register and reload every caller-saved one (callee-saved ones: GDA_O_ below), and its returns store every register, as do those of the direct callees some caller reads past the results of (abi_returns). An image keeps full sync when one of its own is reached through a pointer or an export (address_taken: an indirect call cannot tell), or when abi_ok says so. The GOT slots bound to FULL_SPILL host routines are GDA_G_ too. Machine-outlined bodies (outlined_bodies; how many and how found: the last item) have the only convention of their own compiled code has: one sets or keeps argument and scratch registers for its caller's next call, reads and writes its caller's callee-saved registers, and calls on. Each is a GDA_X_ callee and a GDA_RET_ function, so its call sites store every dirty register and reload every caller-saved one, and its returns and tail calls store everything dirty (without abi_returns' closure over its tail calls: their callees keep AAPCS64, and no caller counts on what they leave). GDA_O_ (by recompile.CS_ORDER bit, per function and GDA_G_ slot): the callee-saved registers a callee may leave changed, its closed writes; a call site reloads only these, a full site too. That is sound: under the contract a caller's callee-saved locals hold its values (recompile dirty_in keeps them dirty past the stores that skip them), and a callee that does not leave one changed returns with it as the caller had it, which the local holds (tests/adv abi_xcs, abi_lcs: a function deeper in the call sets it under a save and stores it at a full site of its own). One the callee leaves changed, its returns store (GDA_RET_), so the reload takes the value it left. A GDA_K_ function stores its callee-saved registers again at each exit (recompile localize): a caller that keeps guest state in the CPU struct reads them there. Limits (tests/adv LIMIT): a function with a convention of its own that is not a machine-outlined body (abi_keep, abi_back, abi_tail, abi_fwd, abi_edge, abi_join, abi_lpe, all hand-written; their _ol copies, the same shapes as outlined bodies, pass); a callee-saved register that an export reached through a stub, a GOT slot or a pointer reads at entry (abi_ind, abi_gcs, abi_gcw, abi_bxs); a function only a relative method list reaches (abi_objc, abi_nzcv); an image without register facts (abi_ok), trusted to AAPCS64 at its entries as a host library is (abi_swl, abi_swn, abi_swo); a direct call to an extra entry point, whose facts are its function's primary entry's (abi_xent)."""
     at = lambda k, a: a - images[k]["vm_base"] + images[k]["load"]     # absolute guest address
     fns = {at(k, a): (k, a, f) for k, li in enumerate(lifts) for a, f in li["abi_fn"].items()}
     ins, outs = {g: f[0] for g, (_k, _a, f) in fns.items()}, {g: f[1] for g, (_k, _a, f) in fns.items()}
@@ -895,10 +923,14 @@ def abi_plan(images: list, lifts: list) -> list[tuple[str, set, set, set, set]]:
         taken = sorted(bad & li["abi_taken"])
         why = abi_ok(img) or ("%s, and a pointer or an export reaches it%s" % (say(taken[0]), " (%d more)" % (len(taken) - 1) if len(taken) > 1 else "")
                               if taken else "")
+        how, ol = outlined_bodies(img, li)
+        xd = bad | ol
         xg = {s for s, t in img["gbinds"].items() if t in fns and fns[t][2][0] & R.ABI_NOT_IN or outs.get(t)} | full_gots(img)
-        rets = abi_returns(li["flags"], li["abi_late"] | {a for a in bad if outs[at(k, a)]})
-        keep = rets | {a for _g, (j, a, f) in fns.items() if j == k and any(r[1] in (bad if r[0] == "d" else xg) for r, _e, _s in f[2])}
-        plan.append((why, bad, xg, rets, keep))
+        rets = abi_returns(li["flags"], li["abi_late"] | {a for a in bad if outs[at(k, a)]}) | ol
+        keep = rets | {a for _g, (j, a, f) in fns.items() if j == k and any(r[1] in (xd if r[0] == "d" else xg) for r, _e, _s in f[2])}
+        ocs = {a: R.cs_compact(outs[g]) for g, (j, a, _f) in fns.items() if j == k and outs[g]}
+        ocs.update({s: R.cs_compact(outs[t]) for s, t in img["gbinds"].items() if s in xg and outs.get(t)})
+        plan.append((why, xd, xg, rets, keep, ocs, "%d %s" % (len(ol), how)))
     return plan
 
 def full_gots(img: dict) -> frozenset:
@@ -1162,7 +1194,7 @@ def lift_prep(img: dict) -> dict:
     ptrs = interior_pointers(img, refs=refs)
     ents = interior_entries(img, bounds, eh_resume_points(img, bounds), setjmp_stubs(img), ptrs, refs)
     return {"refs": refs, "ents": ents, "lift": functools.partial(decoded_lift, functools.partial(read_vm, img), ptrs, stub_gots(img), msg=msg_gots(img),
-                                     abi=not abi_ok(img), noret=noreturn_starts(img) if not abi_ok(img) else frozenset(), refs=refs)}
+                                     abi=not abi_ok(img), noret=noreturn_starts(img) | noreturn_stubs(img) if not abi_ok(img) else frozenset(), refs=refs)}
 
 def lift_finish(img: dict, k: int, out_dir: str, pre: dict, chunks: list, tot: dict, host_gots: frozenset) -> dict:
     """lift_image's result from the written chunks ([(path, index, addresses)]) and their totals: writes image<k>_t.c."""
@@ -1173,6 +1205,7 @@ def lift_finish(img: dict, k: int, out_dir: str, pre: dict, chunks: list, tot: d
     flagged = {ads[0] for ads, _fc in tot["flags"]} | extra
     return {**tot, "units": [p for p, _j, _a in chunks] + tot["eh_units"] + [tail], "entries": sum(len(e) for e in ents.values()),
             "flag_readers_taken": sorted(address_taken(img, refs, flagged)), "flag_extra": extra, "abi_taken": address_taken(img, refs, set(tot["abi_fn"])),
+            "abi_named": address_taken(img, [r for r in refs if r[1] - r[0] == 1], set(tot["abi_fn"])),
             "flag_host": frozenset(s for s, g in stub_gots(img).items() if g in host_gots)}
 
 ###############
@@ -1295,13 +1328,13 @@ def flag_plan(rows: list, taken: list, extra: frozenset = frozenset(), mode: str
 
 def flags_header(everywhere: bool, readers: set, returners: set, msg_slots: dict | None = None, abi: bool = False,
                  rets: set = frozenset(), xd: set = frozenset(), xg: set = frozenset(), leaf: dict | None = None,
-                 cse: bool = False, keep: set = frozenset(), norc: bool = False) -> str:
-    """gd_flags_<k>.h text (passed with -include to the image's chunks): GD_FLAGS_ALL and the GDF_IN_ / GDF_RET_ names recompile.flag_wrap tests, GD_MSG_SLOT<k> (msg_slots: MSG_SENDS index -> its import slot address; recompile GD_MSGSEND) GD_ABI (abi: the image runs under the AAPCS64 register contract, recompile localize) the GDA_RET_, GDA_X_ and GDA_G_ names (rets, xd, xg: abi_plan) GDL_<got> (leaf: GOT vmaddr -> (import slot address, LEAF_DIRECT name); recompile got_call), GD_CSE (cse: no guest unwinder reads saved registers off the guest stack), the GDA_K_ names (keep: abi_plan; recompile CSE_KEEP) and GD_NORC (norc: no guest image in the process has an extra entry point, whose wrappers are the only code that sets c->unw; recompile GD_RC)."""
+                 cse: bool = False, keep: set = frozenset(), norc: bool = False, ocs: dict | None = None) -> str:
+    """gd_flags_<k>.h text (passed with -include to the image's chunks): GD_FLAGS_ALL and the GDF_IN_ / GDF_RET_ names recompile.flag_wrap tests, GD_MSG_SLOT<k> (msg_slots: MSG_SENDS index -> its import slot address; recompile GD_MSGSEND) GD_ABI (abi: the image runs under the AAPCS64 register contract, recompile localize) the GDA_RET_, GDA_X_ and GDA_G_ names (rets, xd, xg: abi_plan), the GDA_O_ masks (ocs: abi_plan) GDL_<got> (leaf: GOT vmaddr -> (import slot address, LEAF_DIRECT name); recompile got_call), GD_CSE (cse: no guest unwinder reads saved registers off the guest stack), the GDA_K_ names (keep: abi_plan; recompile CSE_KEEP) and GD_NORC (norc: no guest image in the process has an extra entry point, whose wrappers are the only code that sets c->unw; recompile GD_RC)."""
     slots = [] if not msg_slots else ["#define GD_MSG_SLOT%d 0x%xULL\n" % (k, (msg_slots or {}).get(k, 1)) for k in range(3)]
     return "".join(["/* generated by gdyld.py: NZCV stores at calls and returns (recompile.flag_wrap) */\n#define GD_FLAGS_ALL %d\n#define GD_ABI %d\n" % (int(everywhere), int(abi))]
                    + ["#define GDF_IN_%x 1\n" % a for a in sorted(readers)] + ["#define GDF_RET_%x 1\n" % a for a in sorted(returners)] + slots
                    + ["#define GDA_RET_%x 1\n" % a for a in sorted(rets)] + ["#define GDA_X_%x 1\n" % a for a in sorted(xd)]
-                   + ["#define GDA_G_%x 1\n" % a for a in sorted(xg)]
+                   + ["#define GDA_G_%x 1\n" % a for a in sorted(xg)] + ["#define GDA_O_%x 0x%x\n" % (a, m) for a, m in sorted((ocs or {}).items())]
                    + ["#define GDL_%x GD_LEAF(0x%xULL, %s)\n" % (g, t, LEAF_DIRECT[n]) for g, (t, n) in sorted((leaf or {}).items())]
                    + ["#define GD_CSE 1\n"] * cse + ["#define GDA_K_%x 1\n" % a for a in sorted(keep)] + ["#define GD_NORC 1\n"] * norc)
 
@@ -1831,13 +1864,13 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     t_lift = time.time()
     lifts, lstats = lift_images(images, out_dir, [host_gots_of(img, host_binds) for img in images])
     report.append("lift: %.0f s, %s" % (time.time() - t_lift, lstats))
-    for k, (img, li, (why, xd, xg, rets, keep)) in enumerate(zip(images, lifts, abi_plan(images, lifts))):
+    for k, (img, li, (why, xd, xg, rets, keep, ocs, nol)) in enumerate(zip(images, lifts, abi_plan(images, lifts))):
         units += li["units"]; ninsn += li["instructions"]; nres += li["resumable"]
-        plans.append((li["units"], flag_plan(li["flags"], li["flag_readers_taken"], li["flag_extra"], host=li["flag_host"]), (not why, rets, xd, xg, keep)))
-        report.append("register contract %s: %s" % (os.path.basename(img["path"]), "full sync at every call (%s)" % why if why else
+        plans.append((li["units"], flag_plan(li["flags"], li["flag_readers_taken"], li["flag_extra"], host=li["flag_host"]), (not why, rets, xd, xg, keep, ocs)))
+        report.append("register contract %s: %s; machine-outlined bodies: %s" % (os.path.basename(img["path"]), "full sync at every call (%s)" % why if why else
                                                      "AAPCS64 (callee-saved registers stay in locals; calls store arguments, returns results; "
                                                      "full stores at calls into %d functions and %d import slots outside the contract, full returns "
-                                                     "from %d)" % (len(xd), len(xg), len(rets))))
+                                                     "from %d)" % (len(xd), len(xg), len(rets)), nol))
         unsupported += [(os.path.basename(img["path"]), hex(u[0]), u[1]) for u in li["unsupported"]]
         report.append("lift %s: %d instructions, %d chunks, %d extra entry points, NZCV: %s, peak RSS %d MB" % (
             os.path.basename(img["path"]), li["instructions"], len(li["units"]), li["entries"],
@@ -1856,10 +1889,10 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     everywhere, unit_flags = any(p[0] for _u, p, _a in plans), {}
     msg_slots = {MSG_SENDS[n[1]]: IMPORT_BASE + j * IMP_SLOT for j, n in enumerate(names) if n[1] in MSG_SENDS}   # the slots gbridge binds them to
     unwinder = any(n in img["exports"] for img in images for n in GUEST_UNWINDER)   # it reads saved registers off the guest stack
-    for k, (us, (_e, readers, returners, _why), (abi, rets, xd, xg, keep)) in enumerate(plans):
+    for k, (us, (_e, readers, returners, _why), (abi, rets, xd, xg, keep, ocs)) in enumerate(plans):
         hdr = os.path.abspath(os.path.join(out_dir, "gd_flags_%d.h" % k))
         text = flags_header(everywhere, set() if everywhere else readers, set() if everywhere else returners, msg_slots, abi, rets, xd, xg,
-                            direct[k], abi and not unwinder, keep, not any(li["entries"] for li in lifts))
+                            direct[k], abi and not unwinder, keep, not any(li["entries"] for li in lifts), ocs)
         open(hdr, "w").write(text)
         unit_flags.update({u: ["-include", hdr, "-DGDF_H=%s" % hashlib.sha256(text.encode()).hexdigest()[:16]] for u in us if u.endswith((".c", ".cc"))})
     report.append("NZCV stores at calls and returns: %s" % ("everywhere" if everywhere else "only into flag-reading callees and out of flag-returning ones"))

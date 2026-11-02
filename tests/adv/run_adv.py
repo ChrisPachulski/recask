@@ -1,7 +1,8 @@
 """Adversarial bed for gdyld: builds every tests/adv program for arm64 (guest) and x86_64 (oracle), records the
 native stdout+exit as expected output, translates each arm64 build with sbt/gdyld.py and diffs its stdout+exit
-against the oracle (MATCH), checks that unsupported cases stop loudly at link or run time (LOUD-OK), and probes the
-shared Apple-arm64 varargs core (sbt/gvarargs.h, used by gdyld and, where present, the printf bridge of sbt/e2e_http.py).
+against the oracle (MATCH; LIMIT for a case that shows a known limit and differs), checks that unsupported cases stop
+loudly at link or run time (LOUD-OK), and probes the shared Apple-arm64 varargs core (sbt/gvarargs.h, used by gdyld
+and, where present, the printf bridge of sbt/e2e_http.py).
 """
 
 ###############
@@ -61,6 +62,26 @@ LOUD = {                                                               # test ->
 DECODED = {                                                            # test -> (functions whose br must decode, ones that must stay undecoded)
     "cgoto": (["_run8", "_run11"], ["_run_raw", "_run_ptr"]),
     "cgoto_patch": (["_run_patch", "_run_word"], [])}
+LIMIT = {                                                              # test -> the known limit it shows (gdyld abi_plan, recompile abi_check: shapes no compiler emits)
+    "abi_keep": "a hand-written callee gives x2 and x9 back from save slots for its caller's next call, which no compiled function does",
+    "abi_back": "a hand-written function reads its caller's x19 after restoring it",
+    "abi_tail": "a hand-written callee sets x9 and d16 for its caller's next call past a tail call into a function that keeps AAPCS64",
+    "abi_fwd": "hand-written callees with the convention of machine-outlined bodies (abi_fwd_ol: the outlined copy)",
+    "abi_edge": "hand-written callees with the convention of machine-outlined bodies (abi_edge_ol: the outlined copy)",
+    "abi_join": "hand-written callees with the convention of machine-outlined bodies (abi_join_ol: the outlined copy)",
+    "abi_lpe": "a hand-written callee sets x2 for its caller's next call",
+    "abi_ind": "a caller reads past the results of a call through a pointer or a stub",
+    "abi_gcs": "an export another image calls through its GOT reads x19 at entry",
+    "abi_gcw": "an export another image calls through a wrapper reads x19 at entry",
+    "abi_bxs": "an export another image calls through a pointer reads x19 at entry",
+    "abi_swl": "an image without register facts is trusted not to read x9 a call before the one into it passed on",
+    "abi_swn": "an image without register facts is trusted not to read x9 at entry",
+    "abi_swo": "an image without register facts is trusted to keep x21",
+    "abi_objc": "a method only a relative method list reaches reads x19 at entry",
+    "abi_nzcv": "a method only a relative method list reaches reads NZCV at entry",
+    "abi_brx": "the call sites past an undecoded br give their function no ABI facts",
+    "abi_xent": "a call to an extra entry gets the primary entry's facts",
+    "abi_psv": "a read of a callee-saved register after its prologue save is not an entry read"}
 LC_ROUTINES_64, ROUTINES_SIZE = 0x1A, 72
 VA_CASES = [                                                           # (name, fmt, [(kind, C expr)]); kind d=double L=long double i=int p=ptr
     ("p12", "%d %u %ld %lld %c %f %e %g %s %x %hhd %zu",
@@ -98,6 +119,36 @@ def plan(root: str) -> dict[str, list[tuple[str, list[str], list[str]]]]:
         "abi_x": [(lib("abi_x", "abix"), ["abi_xlib.c"], iname("abix"))] + exe("abi_x", ["abi_xmain.c", lib("abi_x", "abix")]),
         "abi_peek": exe("abi_peek", ["abi_peek.c"]),
         "abi_late": exe("abi_late", ["abi_late.c"]),
+        "abi_keep": exe("abi_keep", ["abi_keep.c"]),
+        "abi_back": exe("abi_back", ["abi_back.c"]),
+        "abi_fwd": exe("abi_fwd", ["abi_fwd.c"]),
+        "abi_oz": exe("abi_oz", ["abi_oz.c"], ["-Oz"]),
+        "abi_csl": exe("abi_csl", ["abi_csl.c"]),
+        "abi_tail": exe("abi_tail", ["abi_tail.c"]),
+        "abi_edge": exe("abi_edge", ["abi_edge.c"]),
+        "abi_xcs": exe("abi_xcs", ["abi_xcs.c"]),
+        "abi_objc": exe("abi_objc", ["abi_objc.m"], ["-framework", "Foundation"]),
+        "abi_nzcv": exe("abi_nzcv", ["abi_nzcv.m"], ["-framework", "Foundation"]),
+        "abi_lcs": exe("abi_lcs", ["abi_lcs.c"]),
+        "abi_ind": [(lib("abi_ind", "indl"), ["abi_ind_lib.c"], iname("indl"))] + exe("abi_ind", ["abi_ind.c", lib("abi_ind", "indl")]),
+        "abi_swl": [(lib("abi_swl", "swl"), ["abi_swl_lib.c"], iname("swl") + ["-L/usr/lib/swift", "-lswiftCore"])]
+                   + exe("abi_swl", ["abi_swl.c", lib("abi_swl", "swl")]),
+        "abi_gcs": [(lib("abi_gcs", "gcs"), ["abi_gcs_lib.c"], iname("gcs"))] + exe("abi_gcs", ["abi_gcs.c", lib("abi_gcs", "gcs")]),
+        "abi_join": exe("abi_join", ["abi_join.c"]),
+        "abi_swn": [(lib("abi_swn", "swn"), ["abi_swn_lib.c"], iname("swn") + ["-L/usr/lib/swift", "-lswiftCore"])]
+                   + exe("abi_swn", ["abi_swn.c", lib("abi_swn", "swn")]),
+        "abi_swo": [(lib("abi_swo", "swo"), ["abi_swo_lib.c"], iname("swo") + ["-L/usr/lib/swift", "-lswiftCore"])]
+                   + exe("abi_swo", ["abi_swo.c", lib("abi_swo", "swo")]),
+        "abi_gcw": [(lib("abi_gcw", "gcw"), ["abi_gcs_lib.c"], iname("gcw"))] + exe("abi_gcw", ["abi_gcw.c", lib("abi_gcw", "gcw")]),
+        "abi_bxs": [(lib("abi_bxs", "bxs"), ["abi_gcs_lib.c"], iname("bxs"))] + exe("abi_bxs", ["abi_bxs.c", lib("abi_bxs", "bxs")]),
+        "abi_lpe": exe("abi_lpe", ["abi_lpe.c"]),
+        "abi_brx": exe("abi_brx", ["abi_brx.c"]),
+        "abi_xent": exe("abi_xent", ["abi_xent.c"]),
+        "abi_psv": exe("abi_psv", ["abi_psv.c"]),
+        "abi_fwd_ol": exe("abi_fwd_ol", ["abi_fwd_ol.c"]),
+        "abi_edge_ol": exe("abi_edge_ol", ["abi_edge_ol.c"]),
+        "abi_join_ol": exe("abi_join_ol", ["abi_join_ol.c"]),
+        "abi_hsw": exe("abi_hsw", ["abi_hsw.c"]),
         "abi_cs": exe("abi_cs", ["abi_cs.c"]),
         "abi_ptr": exe("abi_ptr", ["abi_ptr.c"]),
         "cse_reread": exe("cse_reread", ["cse_reread.c"]),
@@ -294,6 +345,8 @@ def translated(name: str, exe: str, sdk: str, want: str) -> list[str]:
         fh.write(got)
     rc = int(got.rsplit("EXIT ", 1)[1]) if "EXIT " in got else 999
     status = (loud_status(name, got, want, rc, err) if name in LOUD else
+              ("translated LIMIT (%s; %s)" % (LIMIT[name], first_diff(got, want)) if got != want else
+               "translated LIMIT-FIXED (%s, yet it matches)" % LIMIT[name]) if name in LIMIT else
               "translated MATCH" if got == want else "translated DIFF " + first_diff(got, want))
     status = decode_status(name, res["report"]) or status
     return [status] + info + (["stderr: " + err[-300:]] if err else [])
