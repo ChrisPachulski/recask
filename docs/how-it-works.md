@@ -69,7 +69,7 @@ The output directory also receives these generated files:
 - `host.cpp` — the SDK headers, `sbt/gbridge.hpp` (which includes `sbt/gobjc.hpp`, `sbt/gswift.hpp` and `sbt/gvarargs.h`), `bridge.hpp` and `layout.hpp`.
 
 clang compiles the chunks for x86-64 at `-O2` and `host.cpp` as Objective-C++ at `-O1`, at most 8 at a time, and links `translated` with a 512 MB main-thread stack.
-Chunk objects go through a content-addressed cache keyed by the compile flags and the source text, in `sbt/build/objcache` or `GDYLD_OBJCACHE`.
+Chunk objects go through a content-addressed cache keyed by the compiler version, the SDK build, the compile flags and the source text, in `sbt/build/objcache` or `GDYLD_OBJCACHE`.
 `compile_stats.json` records each compile's seconds and peak memory.
 `host_link_cmds.json` keeps the `host.cpp` compile and link commands, which `tools/relink_host.py` reruns after a change to the host runtime headers.
 A host dylib that the program loads through `@loader_path` or `@executable_path` is symlinked into the output directory.

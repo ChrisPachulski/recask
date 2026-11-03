@@ -1823,10 +1823,15 @@ def run_timed(cmd: list) -> subprocess.CompletedProcess:
     out.rss, out.secs = int(rss.group(1)) if rss else 0, float(real.group(1)) if real else 0.0
     return out
 
+@functools.lru_cache(maxsize=None)
+def compiler_id(cc: str) -> str:
+    """cc's --version text and the default SDK's build version: an Xcode, Command Line Tools or SDK update changes it."""
+    return run([cc, "--version"]).stdout + run(["/usr/bin/xcrun", "--show-sdk-build-version"]).stdout
+
 def cached_compile(cmd: list) -> subprocess.CompletedProcess:
-    """Compile one C chunk through the content-addressed object cache (key: flags + source text)."""
+    """Compile one C chunk through the content-addressed object cache (key: compiler_id + flags + source text)."""
     src, obj = cmd[-3], cmd[-1]
-    key = hashlib.sha256((" ".join(cmd[:-4]) + "\0" + open(src).read()).encode()).hexdigest()
+    key = hashlib.sha256((compiler_id(cmd[0]) + "\0" + " ".join(cmd[:-4]) + "\0" + open(src).read()).encode()).hexdigest()
     hit = os.path.join(OBJ_CACHE, key + ".o")
     if os.path.isfile(hit):
         shutil.copyfile(hit, obj); r = subprocess.CompletedProcess(cmd, 0, "", ""); r.rss, r.secs = 0, 0.0; return r
