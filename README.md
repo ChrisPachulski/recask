@@ -8,40 +8,26 @@
   <img alt="Python 3.9 or newer" src="https://img.shields.io/badge/python-3.9%2B-informational">
 </p>
 
-You have a macOS program built only for arm64, and a Mac with an Intel CPU.
-Recask is a static binary translator: it lifts the program and the arm64 dylibs it links to C, compiles that C for x86-64, and links one native executable for the Intel Mac.
-Calls into macOS go to the Intel Mac's own system libraries, through a bridge that the translator generates for each imported symbol.
+Rosetta 2 lets a Mac with Apple silicon run Intel apps. It does not run the other way.
+Hand an Intel Mac a program built only for arm64 and it answers `Bad CPU type in executable`, and that is the end of it.
+
+Recask is a static binary translator that turns that program into a native x86-64 executable.
+It lifts the program, and the arm64 dylibs it links, to C, compiles that C for x86-64, and links one executable that calls the Intel Mac's own system libraries.
+No emulator rides along: by the time the program starts, its arm64 code is gone.
 In the code and these docs, the translated arm64 program is the guest and the Intel Mac's native side is the host.
-
-It is meant for arm64-only command-line programs: by default a translation is headless, and `--ui-guard-off` lets a translated app reach the window server and the GPU.
-You need the right to run any program you translate (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
-
-## Example: SQLite on an Intel Mac
 
 <p align="center"><img alt="On an Intel iMac: an arm64-only sqlite3 is refused with Bad CPU type, translated, then runs a Mandelbrot query" src="docs/demo/sqlite.gif" width="760"></p>
 
-The SQLite 3.54.1 shell, built for arm64 only on an Apple-silicon Mac, translated and run on an Intel iMac (Core i9-10910).
-The recording reuses compiled chunks from an earlier translation; a first translation of `sqlite3` takes about two minutes on this Mac.
-
-[examples/sqlite/run.sh](examples/sqlite/run.sh) repeats the comparison on any Intel Mac.
-It downloads the SQLite amalgamation and `speedtest1.c` at pinned hashes, builds each for arm64 and for x86-64, translates the arm64 builds, and compares their output with the native x86-64 builds:
-
-- [suite.sql](examples/sqlite/suite.sql), with an in-memory and with an on-disk database: 200,000 inserts, an index, grouping, window functions, JSON, FTS5, R*Tree, math functions and `printf` formats. The output is byte-identical.
-- [mandelbrot.sql](examples/sqlite/mandelbrot.sql), the recursive query in the recording: byte-identical.
-- `speedtest1 --verify --size 25`, SQLite's own benchmark: the same verification hash.
-
-On the same Intel iMac, suite.sql takes 0.5 s as a native x86-64 build and 0.76 s translated (about 1.5 times as long), whether Apple clang 17 (what `run.sh` uses on an Intel Mac) or Apple clang 21 built the arm64 binary.
-With a profile from a run of speedtest1's SQL (`GDYLD_PGO`, [docs/environment.md](docs/environment.md)) and `GDYLD_LTO=thin`, it takes 0.68 s.
-
 ## Features
 
-- **Translated ahead of time** — each arm64 function becomes a C function over a CPU-state struct, and the output executes no arm64 code.
-- **The whole load graph** — the executable and the arm64 dylibs it links are translated into one `translated` executable; a dependency that has an x86-64 slice is used natively instead.
-- **Typed calls into macOS** — a call to a C function that the SDK headers declare is bridged from the Apple arm64 calling convention to the x86-64 one, with the types of its prototype; calls with special rules, such as `printf` or `objc_msgSend`, have hand-written bridges.
-- **Objective-C, blocks and Swift** — guest classes are registered with the host Objective-C runtime, guest blocks become host blocks, and Swift imports are bridged with signatures read from swiftc's own LLVM IR.
-- **C++ and its exceptions** — the C++ runtime a program links is replaced by arm64 builds of libc++, libc++abi and libunwind, translated with the program.
-- **Loud stops** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line on stderr and exit status 70.
-- **Differential tests** — most test beds build each program for arm64 and x86-64 and compare the translated run with the native one.
+- **Native code, not emulation** — each arm64 function becomes a C function over a CPU-state struct, and the output executes no arm64 code.
+- **Byte-identical on real software** — the translated SQLite shell matches a native x86-64 build byte for byte, and reproduces SQLite's own speedtest1 hash ([the run](#example-sqlite-on-an-intel-mac)).
+- **Close to native speed** — on an Intel iMac that SQLite suite takes 0.76 s translated and 0.5 s native.
+- **The whole load graph** — the program and the arm64 dylibs it links become one `translated` executable; a dependency with an x86-64 slice is used natively.
+- **Typed calls into macOS** — C functions the SDK headers declare are bridged to the x86-64 calling convention with their prototypes' types; `printf` and `objc_msgSend` get hand-written bridges.
+- **Objective-C, blocks, Swift and C++** — guest classes register with the host Objective-C runtime, Swift imports are bridged with swiftc's own signatures, and C++ exceptions unwind.
+- **Loud stops, never quiet guesses** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line and exit status 70.
+- **Proved against native** — most of its 26 test beds compare a translated arm64 build with a native x86-64 build of the same program; single instructions are checked against the Unicorn emulator.
 
 ## Install
 
@@ -108,7 +94,37 @@ Three things to know before your own program:
 - **Keep `out` where it is.** `translated` reads the guest images `out/image0.bin`, `out/image1.bin` and so on from their absolute paths each time it starts.
 - **`--ui-guard-off` is the only option.** It switches off the UI guard described under [Limits](#limits); any other `--` option is refused with the usage line.
 
+## Example: SQLite on an Intel Mac
+
+The SQLite 3.54.1 shell, built for arm64 only on an Apple-silicon Mac, translated and run on an Intel iMac (Core i9-10910).
+The recording reuses compiled chunks from an earlier translation; a first translation of `sqlite3` takes about two minutes on this Mac.
+
+[examples/sqlite/run.sh](examples/sqlite/run.sh) repeats the comparison on any Intel Mac.
+It downloads the SQLite amalgamation and `speedtest1.c` at pinned hashes, builds each for arm64 and for x86-64, translates the arm64 builds, and compares their output with the native x86-64 builds:
+
+- [suite.sql](examples/sqlite/suite.sql), with an in-memory and with an on-disk database: 200,000 inserts, an index, grouping, window functions, JSON, FTS5, R*Tree, math functions and `printf` formats. The output is byte-identical.
+- [mandelbrot.sql](examples/sqlite/mandelbrot.sql), the recursive query in the recording: byte-identical.
+- `speedtest1 --verify --size 25`, SQLite's own benchmark: the same verification hash.
+
+On the same Intel iMac, suite.sql takes 0.5 s as a native x86-64 build and 0.76 s translated (about 1.5 times as long), whether Apple clang 17 (what `run.sh` uses on an Intel Mac) or Apple clang 21 built the arm64 binary.
+With a profile from a run of speedtest1's SQL (`GDYLD_PGO`, [docs/environment.md](docs/environment.md)) and `GDYLD_LTO=thin`, it takes 0.68 s.
+
+<details>
+<summary>The features in full</summary>
+
+- **Translated ahead of time** — each arm64 function becomes a C function over a CPU-state struct, and the output executes no arm64 code.
+- **The whole load graph** — the executable and the arm64 dylibs it links are translated into one `translated` executable; a dependency that has an x86-64 slice is used natively instead.
+- **Typed calls into macOS** — a call to a C function that the SDK headers declare is bridged from the Apple arm64 calling convention to the x86-64 one, with the types of its prototype; calls with special rules, such as `printf` or `objc_msgSend`, have hand-written bridges.
+- **Objective-C, blocks and Swift** — guest classes are registered with the host Objective-C runtime, guest blocks become host blocks, and Swift imports are bridged with signatures read from swiftc's own LLVM IR.
+- **C++ and its exceptions** — the C++ runtime a program links is replaced by arm64 builds of libc++, libc++abi and libunwind, translated with the program.
+- **Loud stops** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line on stderr and exit status 70.
+- **Differential tests** — most test beds build each program for arm64 and x86-64 and compare the translated run with the native one.
+
+</details>
+
 ## How it works
+
+Calls into macOS go to the Intel Mac's own system libraries, through a bridge that the translator generates for each imported symbol.
 
 ```mermaid
 flowchart TD
@@ -156,6 +172,8 @@ At start, `translated` maps the guest images at fixed addresses from `0x20000000
 
 ## Limits
 
+It is meant for arm64-only command-line programs: by default a translation is headless, and `--ui-guard-off` lets a translated app reach the window server and the GPU.
+
 - Only the executable and the arm64 dylibs it links are translated; `dlopen` of any other arm64 file returns `NULL`, and `dlerror()` says why.
 - Code the program generates while it runs is not translated; a branch outside the translated images and the known bridges stops with `FATAL: indirect branch to an unmapped target`.
 - SVE and SME instructions are lifted to a stop that fires only if one runs; other instructions with no lifter case are counted on the last line of `tools/translate.py`, which then exits 1.
@@ -200,7 +218,13 @@ Beds of your own go in `tools/beds_local.txt`, which git ignores.
 To add an instruction that a translation reports as unsupported, [docs/lifter.md](docs/lifter.md) shows where its case goes and how to test it against the Unicorn emulator.
 [docs/testing.md](docs/testing.md) covers the beds that check whole programs.
 
+## Why "Recask"?
+
+A whisky moved into a new cask to finish keeps its spirit and takes on new wood.
+Recask moves a program to a new CPU: the same program, finished in new instructions.
+
 ## License
 
 [MIT](LICENSE).
+You need the right to run any program you translate (see [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)).
 The repository bundles no third-party code; the LLVM runtime sources and the Python packages are fetched at setup time under their own licenses, as [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) lists.
