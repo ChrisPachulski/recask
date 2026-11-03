@@ -81,7 +81,8 @@ LIMIT = {                                                              # test ->
     "abi_nzcv": "a method only a relative method list reaches reads NZCV at entry",
     "abi_brx": "the call sites past an undecoded br give their function no ABI facts",
     "abi_xent": "a call to an extra entry gets the primary entry's facts",
-    "abi_psv": "a read of a callee-saved register after its prologue save is not an entry read"}
+    "abi_psv": "a read of a callee-saved register after its prologue save is not an entry read",
+    "abi_sjp": "setjmp called through a pointer leaves its return site no resume point"}
 LC_ROUTINES_64, ROUTINES_SIZE = 0x1A, 72
 VA_CASES = [                                                           # (name, fmt, [(kind, C expr)]); kind d=double L=long double i=int p=ptr
     ("p12", "%d %u %ld %lld %c %f %e %g %s %x %hhd %zu",
@@ -149,6 +150,10 @@ def plan(root: str) -> dict[str, list[tuple[str, list[str], list[str]]]]:
         "abi_edge_ol": exe("abi_edge_ol", ["abi_edge_ol.c"]),
         "abi_join_ol": exe("abi_join_ol", ["abi_join_ol.c"]),
         "abi_hsw": exe("abi_hsw", ["abi_hsw.c"]),
+        "abi_unw": exe("abi_unw", ["abi_unw.cpp"]),
+        "abi_sjmp": exe("abi_sjmp", ["abi_sjmp.c"]),
+        "abi_sjp": exe("abi_sjp", ["abi_sjp.c"]),
+        "abi_vla": exe("abi_vla", ["abi_vla.cpp"]),
         "abi_cs": exe("abi_cs", ["abi_cs.c"]),
         "abi_ptr": exe("abi_ptr", ["abi_ptr.c"]),
         "cse_reread": exe("cse_reread", ["cse_reread.c"]),

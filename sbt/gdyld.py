@@ -846,13 +846,14 @@ def refs_meeting(refs: list | None, lo: int, hi: int) -> list | None:
     return None if refs is None else [r for r in refs[bisect.bisect_left(refs, (lo - 0x1000, 0)):bisect.bisect_left(refs, (hi, 0))] if r[1] > lo]
 
 def decoded_lift(read: object, ptrs: list, gots: dict, insns: list, fstarts: set, cname: str, resume: list | None = None,
-                 msg: dict | None = None, abi: bool = False, noret: frozenset = frozenset(), refs: list | None = None) -> tuple:
+                 msg: dict | None = None, abi: bool = False, noret: frozenset = frozenset(), refs: list | None = None,
+                 rejoin: frozenset = frozenset()) -> tuple:
     """R.lift_function with the jump-table reader, the per-function proof that no code pointer lands in its interior, and inline-cached indirect and import-stub calls (gots: stub vmaddr -> GOT vmaddr; msg: GOT vmaddr -> objc_msgSend family member, msg_gots; abi: not abi_ok; noret: noreturn_starts; refs: pointer_refs, of which the ranges that meet the function go to the lift: a label table's words may be rewritten to any of them)."""
     lo, hi = insns[0].address, insns[-1].address + insns[-1].size
     k = bisect.bisect_right(ptrs, lo)
     inside = k < len(ptrs) and ptrs[k] < hi
     return R.lift_function_x(insns, fstarts, cname, resume, read, inside, stubs=gots, ic=True, msg=msg, abi=abi, noret=noret,
-                             refs=refs_meeting(refs, lo, hi))
+                             refs=refs_meeting(refs, lo, hi), rejoin=rejoin)
 
 def abi_ok(img: dict) -> str:
     """Why the image's code may not run under the AAPCS64 register contract (recompile localize abi), before its lift: it links a Swift library (Swift returns errors in x21 and passes self and async contexts in x20 and x22, registers C keeps across calls) or GDYLD_ABI=0; else ''."""
@@ -1023,14 +1024,14 @@ def function_source(img: dict, k: int, lift: object, entries: dict, cxx: bool, s
         if ents: raise LookupError("%s: branch into the interior of intrinsic 0x%x" % (img["path"], start))
         return [start], "void func_%x(CPU *c) { %s(c); }\n" % (start, intr[start]), len(insns), [], False, HOST_FLAGS, ""   # host code: guest NZCV untouched
     if rp and not ents:
-        r = lift(insns, fset, "m%d_b_%x" % (k, start), rp)
+        r = lift(insns, fset, "m%d_b_%x" % (k, start), rp, rejoin=frozenset(rp))
         b, arr = "m%d_b_%x" % (k, start), "m%d_rp_%x" % (k, start)
         tab = "const uint64_t %s[] = {%s};\n" % (arr, ", ".join("0x%xULL" % ((a + img["slide"]) & MASK64) for a in rp))
         if cxx: return [start], INLINE_BODY + r[0] + "static " + tab + eh_wrappers_cxx(b, arr, len(rp), [(start, -1)]), \
             len(insns), r[1], True, r[4] if len(r) > 4 else None, ""
         return [start], r[0] + tab, len(insns), r[1], True, r[4] if len(r) > 4 else None, eh_wrappers(k, b, arr, len(rp), [(start, -1)])
     if ents:
-        r = lift(insns, fset, "m%d_b_%x" % (k, start), roots)
+        r = lift(insns, fset, "m%d_b_%x" % (k, start), roots, rejoin=frozenset(rp))
         body, uns = r[0], r[1]
         b = "m%d_b_%x" % (k, start)
         if rp:                                                         # the body and its resume table are called from the C++ wrappers
