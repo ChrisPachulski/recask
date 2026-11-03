@@ -1,4 +1,4 @@
-<h1 align="center">arm64-x86-recomp</h1>
+<h1 align="center">Recask</h1>
 
 <p align="center"><em>The arm64 code never runs. Its x86-64 translation does.</em></p>
 
@@ -9,7 +9,7 @@
 </p>
 
 You have a macOS program built only for arm64, and a Mac with an Intel CPU.
-arm64-x86-recomp is a static binary translator: it lifts the program and the arm64 dylibs it links to C, compiles that C for x86-64, and links one native executable for the Intel Mac.
+Recask is a static binary translator: it lifts the program and the arm64 dylibs it links to C, compiles that C for x86-64, and links one native executable for the Intel Mac.
 Calls into macOS go to the Intel Mac's own system libraries, through a bridge that the translator generates for each imported symbol.
 In the code and these docs, the translated arm64 program is the guest and the Intel Mac's native side is the host.
 
