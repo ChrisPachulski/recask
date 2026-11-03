@@ -15,6 +15,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (library under test)
+import gate  # noqa: E402
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
 BUILD = os.path.join(HERE, "build")
@@ -46,7 +47,7 @@ def run_exe(argv: list[str], extra: dict[str, str]) -> tuple[int, str, str]:
 
 def match_line(name: str, want: tuple[int, str, str], got: tuple[int, str, str]) -> str:
     """'PASS|FAIL name ...' for an ok-run against the native oracle."""
-    ok = (got[0], got[1]) == (want[0], want[1])
+    ok = gate.same(got, want)
     return "%s %s exit %d%s" % ("PASS" if ok else "FAIL", name, got[0], "" if ok else " | got %r | want %r | stderr %s" % (got[1], want[1], got[2][-600:]))
 
 def loud_line(exe: str, mode: str, env: dict[str, str], code: int, text: str) -> str:
@@ -75,3 +76,4 @@ ROWS.append("%s profiler redaction: exit %d, translated group %s, guest-address 
     "PASS" if SPIN[0] == 0 and "translated guest code" in REPORT and not LEAKS else "FAIL", SPIN[0], "translated guest code" in REPORT, LEAKS))
 for _r in ROWS: print(_r)
 print("summary: %d/%d PASS" % (sum(r.startswith("PASS") for r in ROWS), len(ROWS)))
+gate.finish([(r.split(None, 1)[1].split(" exit ")[0], r) for r in ROWS])

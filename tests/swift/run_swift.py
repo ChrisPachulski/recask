@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (library under test)
+import gate  # noqa: E402
 import gswift  # noqa: E402
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
@@ -63,7 +64,7 @@ def verdict(name: str) -> str:
     got = run_exe(res["exe"], {"GDYLD_TRACE_IMPORTS": "1"})          # stderr ends with the imports called
     save(out, "translated", got)
     open(os.path.join(out, "imports_called.txt"), "w").write("".join(ln + "\n" for ln in got[2].splitlines() if ln.startswith("import-trace ")))
-    if (got[0], got[1]) == (oracle[0][0], oracle[0][1]):
+    if gate.same(got, oracle[0]):
         return "MATCH (exit %d, %d lines) | %s" % (got[0], len(got[1].splitlines()), info)
     diff = "".join(difflib.unified_diff(oracle[0][1].splitlines(True), got[1].splitlines(True), "native", "translated"))
     return "MISMATCH exit native %d translated %d | %s\n%s\n  translated stderr tail: %s" % (
@@ -80,3 +81,4 @@ for n in NAMES:
     results[n] = verdict(n)
     print("== %s (%.0f s): %s" % (n, time.time() - t, results[n]), flush=True)
 print("summary: %s" % {n: v.split()[0] for n, v in results.items()})
+gate.finish(list(results.items()))

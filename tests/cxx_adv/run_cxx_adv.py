@@ -18,6 +18,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (lane library under test)
+import gate  # noqa: E402
 BUILD = os.path.join(HERE, "build")
 ARCHES = ("x86_64", "arm64")
 RUN_TIMEOUT = 300                                                      # s per program run
@@ -97,7 +98,7 @@ def one_test(name: str, sdk: str) -> list[str]:
     got, err, gt = program_run(res["exe"], os.path.dirname(exe["arm64"]))
     save("translated", name, got)
     diff = list(difflib.unified_diff(want.splitlines(), got.splitlines(), "native", "translated", n=1, lineterm=""))
-    status = "MATCH" if got == want else "DIFF"
+    status = "MATCH" if gate.same(got, want) else "DIFF"
     return (["%-14s %s | native %d lines %s %.1f s | translated %s %.1f s | translate+build %.0f s" % (
                 name, status, want.count("\n"), want.splitlines()[-1], wt, got.splitlines()[-1] if got else "<none>", gt, tt)]
             + ["    " + ln for ln in diff[2:2 + DIFF_LINES]]
@@ -124,3 +125,4 @@ for n in SELECTED:
 STATUS = [ln for ln in LINES if not ln.startswith(" ")]
 print("summary: %d/%d MATCH; not matching: %s" % (
     sum(1 for ln in STATUS if " MATCH " in ln), len(SELECTED), [ln.split()[0] for ln in STATUS if " MATCH " not in ln]))
+gate.finish([(ln.split()[0], " ".join(ln.split()[1:])) for ln in STATUS])

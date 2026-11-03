@@ -193,7 +193,7 @@ sbtenv/bin/python tools/run_beds.py --jobs=2 adv cxx   # two named beds, 2 at a 
 ```
 
 Each bed writes `tests/beds_logs/<bed>.log`, and `run_beds.py` prints one line per bed with its exit status, seconds and last summary line.
-Most bed runners exit 0 even when a case fails, so read the summary lines: `run_beds.py` exits 1 only when a bed exits nonzero.
+Every bed exits 1 when a case fails, other than the known gaps it lists from [docs/limits.md](docs/limits.md), and `run_beds.py` exits 1 when any bed does.
 Beds of your own go in `tools/beds_local.txt`, which git ignores.
 
 [docs/testing.md](docs/testing.md) lists every bed, the `beds_local.txt` format, and the runners that are not in the default list.

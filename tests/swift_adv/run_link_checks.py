@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (library under test)
+import gate  # noqa: E402
 import gswift  # noqa: E402
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
@@ -75,7 +76,7 @@ def verdict(name: str) -> str:
         return "TRANSLATE-FAIL %s: %s" % (type(e).__name__, str(e)[-1500:])
     if res["error"]: return "TRANSLATE-FAIL build error: %s" % res["error"][-1500:]
     got = run_exe(res["exe"])
-    tag = "MATCH" if (got[0], got[1]) == (want[0], want[1]) else "MISMATCH"
+    tag = "MATCH" if gate.same(got, want) else "MISMATCH"
     return "%s native %r translated %r stderr %r | entries %s" % (tag, (want[0], want[1]), (got[0], got[1]), got[2][-300:], entries(gd, [FN, DATA, WEAK]))
 
 ###############
@@ -89,3 +90,4 @@ gswift.sigdb = lambda path=gswift.SIGDB: db                   # gdyld reads gswi
 results = {n: verdict(n) for n in ("weak", "twins")}
 for n, v in results.items(): print("== %s: %s" % (n, v))
 print("summary: %s" % {n: v.split()[0] for n, v in results.items()})
+gate.finish(list(results.items()))

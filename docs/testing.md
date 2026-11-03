@@ -17,7 +17,7 @@ sbtenv/bin/python tools/run_beds.py [--jobs=N] [--log=<dir>] [bed names ...]
 
 With no names it runs every bed, 4 at a time (`--jobs`), and writes one log per bed to `tests/beds_logs/` (`--log`).
 It prints one line per bed (name, exit status, seconds, and the last line of its log that looks like a summary), then a total line that lists the beds that exited nonzero.
-Most bed runners exit 0 even when a case fails, so read the summary lines; `run_beds.py` exits 1 only when a bed exits nonzero.
+Every bed exits 1 when a case fails, and `run_beds.py` exits 1 when any bed does. A case passes on MATCH, LOUD-OK, LIMIT, LIMIT-FIXED, PASS or OK; a run that timed out never matches, even when the native run timed out too. The only failures allowed are the known gaps a runner lists with their reason (`m5b_cb`: `c1_cfuncs` and `c5_fts`, both in [limits.md](limits.md)). Each bed ends with a `gate:` line naming what failed (`sbt/gate.py`).
 
 | Bed | Runner | What it checks |
 |---|---|---|

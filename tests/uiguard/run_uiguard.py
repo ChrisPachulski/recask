@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld
+import gate
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
 BUILD = os.path.join(HERE, "build")
@@ -46,6 +47,7 @@ def loud(exe: str, case: str) -> bool:
     rc, out, last = run_case(exe, case)
     good = rc == 70 and MARK in last and "REACHED" not in out and out == "case %s: before\n" % case
     print("%-11s %s exit %d | %s" % (case, "LOUD-OK" if good else "FAIL", rc, last))
+    VERDICTS.append((case, "LOUD-OK" if good else "FAIL"))
     return good
 
 def table_routes(bridge: str, names: list) -> dict[str, str]:
@@ -55,6 +57,7 @@ def table_routes(bridge: str, names: list) -> dict[str, str]:
 ###############
 # run
 ###############
+VERDICTS: list[tuple[str, str]] = []
 _err = build()
 print("build: %s" % (_err or "ok"))
 _res = gdyld.translate(GUEST, os.path.join(BUILD, "gdyld"), SDK)
@@ -68,3 +71,4 @@ _ok = sum(loud(_res["exe"], c) for c in CASES) if _preflight else 0
 _rc, _out, _last = run_case(_res["exe"], "ok")
 print("ok          %s exit %d | stdout %r" % ("PASS" if _rc == 0 and "7-foundation ok" in _out else "FAIL", _rc, _out))
 print("RESULT: %d/%d guarded cases stopped loudly before the call" % (_ok, len(CASES)))
+gate.finish(VERDICTS + [("pre-flight", "PASS" if _preflight else "FAIL"), ("ok", "PASS" if _rc == 0 and "7-foundation ok" in _out else "FAIL")])

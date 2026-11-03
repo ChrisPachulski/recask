@@ -1,7 +1,7 @@
 """Runs the main bed list in parallel workers (GPU beds afterwards, one at a time), one log per bed, and prints each
 bed's exit, seconds and summary line. Extra beds (tools/beds_local.txt, optional) run after the
 built-in ones. Usage: run_beds.py [--jobs=N] [--log=<dir>] [bed names ...] (default: all, 4 jobs).
-Most runners exit 0 even on failure, so the printed summary lines are what to read; exit 1 if any bed exited nonzero."""
+Every runner exits 1 when a case fails (sbt/gate.py; known gaps are listed in the runner); exit 1 if any bed exited nonzero."""
 ###############
 # imports and constants
 ###############
@@ -43,7 +43,7 @@ LOCAL = [l.split() for l in (open(LOCAL_FILE) if os.path.exists(LOCAL_FILE) else
 BEDS = PUBLIC_BEDS + [(r[1], r[2:]) for r in LOCAL if r[0] == "cpu"]
 GPU_BEDS = [(r[1], r[2:]) for r in LOCAL if r[0] == "gpu"]            # run one at a time after the CPU beds
 AFTER = {r[1]: r[2:] for r in LOCAL if r[0] == "after"}                # a follow-on step that needs its bed's build
-SUMMARY = re.compile(r"summary|RESULT|ALL PASS|ALL \d+|failed|byte-identical|PASS$|\d+/\d+")
+SUMMARY = re.compile(r"^gate:|summary|RESULT|ALL PASS|ALL \d+|failed|byte-identical|PASS$|\d+/\d+")
 
 ###############
 # functions

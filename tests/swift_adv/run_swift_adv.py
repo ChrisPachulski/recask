@@ -11,6 +11,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (library under test)
+import gate  # noqa: E402
 import gswift  # noqa: E402
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
@@ -84,13 +85,13 @@ def verdict(name: str) -> str:
     info = "gdyld %.0f s, %s, unsupported insns %d" % (time.time() - t0, sw, len(res["unsupported"]))
     got = run_exe(res["exe"])
     save(out, "translated", got)
-    if (got[0], got[1]) == (oracle[0][0], oracle[0][1]) and name in INSN_BOUND:
+    if gate.same(got, oracle[0]) and name in INSN_BOUND:
         nat, tr = insns(x86), insns(res["exe"])
         ratio = tr / nat if nat and tr else float("inf")
         if ratio > INSN_BOUND[name]:
             return "SLOW translated %d / native %d instructions = %.1fx, bound %dx | %s" % (tr, nat, ratio, INSN_BOUND[name], info)
         info += ", instructions %.1fx native (bound %dx)" % (ratio, INSN_BOUND[name])
-    if (got[0], got[1]) == (oracle[0][0], oracle[0][1]):
+    if gate.same(got, oracle[0]):
         return "MATCH (exit %d, %d lines) | %s" % (got[0], len(got[1].splitlines()), info)
     diff = "".join(difflib.unified_diff(oracle[0][1].splitlines(True), got[1].splitlines(True), "native", "translated"))
     return "MISMATCH exit native %d translated %d | %s\n%s\n  translated stderr tail: %s" % (
@@ -112,3 +113,4 @@ for n in NAMES:
     results[n] = verdict(n)
     print("== %s (%.0f s): %s" % (n, time.time() - t, results[n]), flush=True)
 print("summary: %s" % {n: v.split()[0] for n, v in results.items()})
+gate.finish(list(results.items()))

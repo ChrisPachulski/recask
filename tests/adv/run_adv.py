@@ -26,6 +26,7 @@ E2E = os.path.join(SBT, "e2e_http.py")
 GVARARGS = os.path.join(SBT, "gvarargs.h")
 sys.path.insert(0, SBT)
 import gdyld  # noqa: E402  (lane library under test)
+import gate  # noqa: E402
 BUILD = os.path.join(ADV, "build")
 ARCHES = ("x86_64", "arm64")
 RUN_TIMEOUT = 60                                                       # s per native run
@@ -299,6 +300,7 @@ def oracle(tests: dict[str, list[tuple[str, list[str], list[str]]]], sdk: str) -
         with open(os.path.join(BUILD, "expected", name + ".txt"), "w") as fh:
             fh.write(out + "EXIT %d\n" % rc)
         side = translated(name, exe["arm64"], sdk, out + "EXIT %d\n" % rc) if not errs["arm64"] else ["translated BLOCKED: arm64 build failed"]
+        VERDICTS.append((name, "BUILD-FAIL x86_64" if errs["x86_64"] else side[0].split(None, 1)[1]))
         lines.append("%-22s x86 build %s | arm64 build %s (%s) | native exit %d, %d stdout lines | %s" % (
             name, "ok" if not errs["x86_64"] else "FAIL", "ok" if not errs["arm64"] else "FAIL",
             archs_of(exe["arm64"]), rc, out.count("\n"), side[0]))
@@ -437,6 +439,7 @@ def gfmt_probe(sdk: str) -> list[str]:
 # Run
 
 SDK = run(["/usr/bin/xcrun", "--show-sdk-path"]).stdout.strip()
+VERDICTS: list[tuple[str, str]] = []                                   # (test, verdict) for the gate
 ALL = plan(os.path.join(BUILD, "x86_64"))
 TESTS = {n: ALL[n] for n in sys.argv[1:]} or ALL                       # argv: run only the named tests
 for t in ([""] if TESTS is ALL else [os.path.join(a, n) for a in ARCHES for n in TESTS]):
@@ -444,4 +447,8 @@ for t in ([""] if TESTS is ALL else [os.path.join(a, n) for a in ARCHES for n in
 print("lane gdyld runner present: %s" % os.path.exists(GDYLD))
 print("\n".join(oracle(TESTS, SDK)))
 print("--- shared varargs core (sbt/gvarargs.h, included by e2e_http.py HOST_RT) + e2e _printf body vs native snprintf")
-print("\n".join(gfmt_probe(SDK)))
+PROBE = gfmt_probe(SDK)
+print("\n".join(PROBE))
+VERDICTS += [(ln.split()[1], ln.split()[2]) for ln in PROBE if ln.startswith("CASE ")]
+VERDICTS += [("probe", "FAIL " + ln) for ln in PROBE if ln.startswith(("TRAP", "probe FAIL", "probe build FAIL"))]
+gate.finish(VERDICTS)

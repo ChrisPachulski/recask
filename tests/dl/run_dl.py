@@ -12,6 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (library under test)
+import gate  # noqa: E402
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
 BUILD = os.path.join(HERE, "build")
@@ -50,7 +51,7 @@ def verdict(native: str, translated: str) -> str:
     oracle = [run_exe([native]) for _ in range(3)]
     if len({(r[0], r[1]) for r in oracle}) != 1: return "UNSTABLE-ORACLE exits %s" % [r[0] for r in oracle]
     got = run_exe([translated])
-    if (got[0], got[1]) == (oracle[0][0], oracle[0][1]): return "MATCH (exit %d, %d lines)\n%s" % (got[0], len(got[1].splitlines()), got[1])
+    if gate.same(got, oracle[0]): return "MATCH (exit %d, %d lines)\n%s" % (got[0], len(got[1].splitlines()), got[1])
     diff = "".join(difflib.unified_diff(oracle[0][1].splitlines(True), got[1].splitlines(True), "native", "translated"))
     return "MISMATCH exit native %d translated %d\n%s\n  translated stderr tail: %s" % (oracle[0][0], got[0], diff, got[2][-1200:])
 
@@ -62,7 +63,9 @@ GUEST, ERR_A = build("arm64")
 print("build: %s" % (ERR_X + ERR_A or "ok"))
 RES = gdyld.translate(GUEST, os.path.join(BUILD, "gdyld"), SDK)
 print("translate: error %r; specials %s" % (RES["error"][-500:], sorted(n for n in RES["classes"].get("special", []) if "dl" in n)))
-print("dl_main: %s" % verdict(NATIVE, RES["exe"]))
+MAIN = verdict(NATIVE, RES["exe"]) if not RES["error"] else "TRANSLATE-FAIL"
+print("dl_main: %s" % MAIN)
 OUT = run_exe([RES["exe"], "outside"])
 OK = OUT[0] == 0 and "outside: NULL | gdyld:" in OUT[1] and "not part of this translation" in OUT[1]
 print("outside (translated only): %s exit %d | %s" % ("LOUD-OK" if OK else "FAIL", OUT[0], OUT[1].strip()))
+gate.finish([("build", "FAIL" if ERR_X + ERR_A else "OK"), ("dl_main", MAIN), ("outside", "LOUD-OK" if OK else "FAIL")])

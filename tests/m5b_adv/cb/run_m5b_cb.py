@@ -11,11 +11,14 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(os.path.dirname(HERE)))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (library under test)
+import gate  # noqa: E402
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
 CC = ["clang", "-isysroot", SDK, "-mmacosx-version-min=13", "-O1", "-w", "-fobjc-arc", "-framework", "Foundation"]
 CXX = ["-std=c++17", "-nostdinc++", "-isystem", os.path.join(SDK, "usr", "include", "c++", "v1"), "-lc++"]
 EXTRA = {"c4_coretext": ["-framework", "CoreText"]}
+KNOWN = {"c1_cfuncs": "a variadic function with no bridge, CFStringCreateWithFormat (docs/limits.md)",
+         "c5_fts": "callback pointer identity: fts_open stores the bridge, not the guest comparator (docs/limits.md)"}
 ARGV_CASES = {"c3_exc": [["uncaught"]], "c5_fts": [["nocmp"]], "c6_exit_flush": [["fopen"], ["funopen"]]}
 RUN_TIMEOUT = 120                                              # seconds per run
 SRCS = sorted(glob.glob(os.path.join(HERE, "c*.m")) + glob.glob(os.path.join(HERE, "c*.mm")))
@@ -47,26 +50,29 @@ def compare(native: str, translated: str, extra: list[str]) -> str:
     oracle = [run_exe([native] + extra) for _ in range(3)]
     if len({(r[0], r[1]) for r in oracle}) != 1: return "UNSTABLE-ORACLE %s" % [(r[0], r[1][-200:]) for r in oracle]
     got = run_exe([translated] + extra)
-    if (got[0], got[1]) == (oracle[0][0], oracle[0][1]): return "MATCH (exit %d, %d lines)" % (got[0], len(got[1].splitlines()))
+    if gate.same(got, oracle[0]): return "MATCH (exit %d, %d lines)" % (got[0], len(got[1].splitlines()))
     diff = "".join(difflib.unified_diff(oracle[0][1].splitlines(True), got[1].splitlines(True), "native", "translated", n=0))
     return "MISMATCH native exit %d translated %d\n%s  translated stderr tail: %s" % (oracle[0][0], got[0], diff[-3500:], got[2].strip()[-1500:])
 
-def verdict(name: str) -> str:
-    """All verdict lines of one program."""
+def verdict(name: str) -> list[tuple[str, str]]:
+    """(case, verdict) for each argument list of one program: the case is the name plus its arguments."""
     x86, ex = build(name, "x86_64")
     arm, ea = build(name, "arm64")
-    if ex or ea: return "BUILD-FAIL %s" % (ex + ea)
+    if ex or ea: return [(name, "BUILD-FAIL %s" % (ex + ea))]
     try:
         res = gdyld.translate(arm, os.path.join(HERE, "build", name, "gdyld"), SDK)
     except Exception as e:
-        return "TRANSLATE-FAIL %s: %s" % (type(e).__name__, str(e)[-2000:])
-    if res["error"]: return "TRANSLATE-FAIL build error: %s" % res["error"][-2500:]
-    return "\n".join("%s%s" % ("" if not a else "[%s] " % " ".join(a), compare(x86, res["exe"], a)) for a in [[]] + ARGV_CASES.get(name, []))
+        return [(name, "TRANSLATE-FAIL %s: %s" % (type(e).__name__, str(e)[-2000:]))]
+    if res["error"]: return [(name, "TRANSLATE-FAIL build error: %s" % res["error"][-2500:])]
+    return [(" ".join([name] + a), compare(x86, res["exe"], a)) for a in [[]] + ARGV_CASES.get(name, [])]
 
 ###############
 # run
 ###############
+VERDICTS = []
 for n in NAMES:
     t = time.time()
     v = verdict(n)
-    print("== %s (%.0f s): %s" % (n, time.time() - t, v), flush=True)
+    print("== %s (%.0f s): %s" % (n, time.time() - t, "\n".join("[%s] " % c[len(n) + 1:] * (c != n) + r for c, r in v)), flush=True)
+    VERDICTS += v
+gate.finish(VERDICTS, KNOWN)

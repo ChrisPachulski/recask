@@ -19,6 +19,7 @@ LANE = os.path.dirname(os.path.dirname(CXX))
 SBT = os.path.join(LANE, "sbt")
 sys.path.insert(0, SBT)
 import gdyld  # noqa: E402  (lane library under test)
+import gate  # noqa: E402
 BUILD = os.path.join(CXX, "build")
 ARCHES = ("x86_64", "arm64")
 RUN_TIMEOUT = 120                                                      # s per program run
@@ -151,7 +152,7 @@ def one_test(name: str, sdk: str) -> list[str]:
         os.makedirs(os.path.join(BUILD, kind), exist_ok=True)
         with open(os.path.join(BUILD, kind, name + ".txt"), "w") as fh:
             fh.write(text)
-    status = loud_status(name, got, want, err) if name in LOUD else "MATCH" if got == want else "DIFF " + first_diff(got, want)
+    status = loud_status(name, got, want, err) if name in LOUD else "MATCH" if gate.same(got, want) else "DIFF " + first_diff(got, want)
     return (["%-14s %s | %d stdout lines, %s | translate+build %.0f s" % (name, status, want.count("\n") - 1, want.splitlines()[-1], tt)]
             + ["    gdyld: " + ln for ln in res["report"][-1:]]
             + ["    unsupported insns %d %s" % (len(res["unsupported"]), res["unsupported"][:3])]
@@ -164,10 +165,13 @@ def one_test(name: str, sdk: str) -> list[str]:
 SDK = run(["/usr/bin/xcrun", "--show-sdk-path"]).stdout.strip()
 shutil.rmtree(BUILD, ignore_errors=True)
 print("guest runtime: %s" % gdyld.GUESTRT)
-print("\n".join(fixup_check()))
+FIXUPS = fixup_check()
+print("\n".join(FIXUPS))
 SELECTED = sys.argv[1:] or list(plan(BUILD))
 LINES = [ln for name in SELECTED for ln in one_test(name, SDK)]
 print("\n".join(LINES))
 print("summary: %d/%d MATCH, %d/%d LOUD-OK" % (
     sum(1 for ln in LINES if not ln.startswith(" ") and " MATCH " in ln), sum(1 for n in SELECTED if n not in LOUD),
     sum(1 for ln in LINES if not ln.startswith(" ") and " LOUD-OK " in ln), sum(1 for n in SELECTED if n in LOUD)))
+gate.finish([("fixups " + ln.split()[1], "PASS" if " identical True" in ln else "FAIL") for ln in FIXUPS]
+            + [(ln.split()[0], " ".join(ln.split()[1:])) for ln in LINES if not ln.startswith(" ")])

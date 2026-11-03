@@ -9,6 +9,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 LANE = os.path.dirname(os.path.dirname(HERE))
 sys.path.insert(0, os.path.join(LANE, "sbt"))
 import gdyld  # noqa: E402  (library under test)
+import gate  # noqa: E402
 
 SDK = subprocess.run(["xcrun", "--show-sdk-path"], capture_output=True, text=True).stdout.strip()
 CC = ["clang", "-isysroot", SDK, "-O1", "-w", "-fobjc-arc", "-framework", "Foundation"]
@@ -58,7 +59,7 @@ def verdict(name: str) -> str:
     if res["error"]: return "TRANSLATE-FAIL build error: %s" % res["error"][-2500:]
     runs = [run_exe(res["exe"]) for _ in range(REPEAT)]
     for i, r in enumerate(runs): save(out, "translated_%d" % i, r)
-    bad = [r for r in runs if (r[0], r[1]) != (oracle[0][0], oracle[0][1])]
+    bad = [r for r in runs if not gate.same(r, oracle[0])]
     info = "unsupported %d, exits %s" % (len(res["unsupported"]), dict(collections.Counter(r[0] for r in runs)))
     if not bad: return "MATCH (exit %d, %d lines, %d runs) | %s" % (oracle[0][0], len(oracle[0][1].splitlines()), REPEAT, info)
     got = bad[0]
@@ -75,3 +76,4 @@ for n in NAMES:
     results[n] = verdict(n)
     print("== %s (%.0f s): %s" % (n, time.time() - t, results[n]), flush=True)
 print("summary: %s" % {n: v.split()[0] for n, v in results.items()})
+gate.finish(list(results.items()))

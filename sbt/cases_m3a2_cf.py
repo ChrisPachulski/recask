@@ -14,6 +14,7 @@ from unicorn.arm64_const import (UC_ARM64_REG_SP, UC_ARM64_REG_X0, UC_ARM64_REG_
 SBT = os.path.abspath(sys.argv[1]) if sys.argv[1:] else os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SBT)
 import recompile as R
+import gate
 
 GUEST_BASE, CODE, DATA, STOP = 0x200000000, 0x10000, 0x240000000, 0x500000000
 HI_PAGE = 0x1000                                                       # bytes mapped at GUEST_BASE + CODE + 4 GB on both sides
@@ -181,3 +182,4 @@ print("== control-flow cases vs Unicorn, recompile from %s" % SBT)
 _res = [run_case(c) for c in CASES]
 for _n, _ok, _d in _res: print("  %-34s %-4s %s" % (_n, "OK" if _ok else "FAIL", _d))
 print("summary: %d/%d OK" % (sum(ok for _n, ok, _d in _res), len(_res)))
+gate.finish([(_n, "OK" if _ok else "FAIL") for _n, _ok, _d in _res])
