@@ -104,6 +104,8 @@ LDBL_MATH = {"acosl", "asinl", "atanl", "atan2l", "cosl", "sinl", "tanl", "acosh
 LDBL_ALIAS = {"strtold": "strtod", "wcstold": "wcstod", "strtold_l": "strtod_l", "wcstold_l": "wcstod_l", "nexttowardl": "nextafter"}
 SYSTEM_PREFIXES = ("/usr/lib/", "/System/")
 BASE_HEADERS = ["stdio.h", "stdlib.h", "string.h", "strings.h", "math.h", "pthread.h", "unistd.h", "time.h",
+                "sys/utsname.h", "netdb.h", "spawn.h", "execinfo.h", "fenv.h", "crt_externs.h", "sys/clonefile.h", "libproc.h",
+                "mach/mach.h", "zlib.h",
                 "errno.h", "fcntl.h", "signal.h", "setjmp.h", "ctype.h", "wchar.h", "locale.h", "dlfcn.h",
                 "sys/socket.h", "sys/select.h", "sys/mman.h", "sys/stat.h", "sys/time.h", "arpa/inet.h",
                 "netinet/in.h", "dispatch/dispatch.h", "xlocale.h", "wctype.h", "nl_types.h", "dirent.h",
@@ -1397,6 +1399,21 @@ def host_clang(sdk: str, headers: list, mode: str) -> subprocess.CompletedProces
     return subprocess.run([CLANGXX, mode] + (["-P"] if mode == "-E" else []) + ["-x", HOST_LANG, "-std=c++17", "-nostdinc++", "-isysroot",
                           sdk, "-arch", "x86_64", "-"], input=src, capture_output=True, text=True)
 
+SIMD_DECL_RE = re.compile(r"^extern simd_\w+ (_simd_\w+|__\w+_[fd]\d+)\([^;]*\);$", re.M)   # simd/math.h: extern C math over vectors
+
+def simd_math_header(sdk: str, imported: set) -> list:
+    """[a generated header: simd/vector_types.h and simd/math.h's own extern declarations] when the guest imports one of
+    those functions, else []: simd/math.h itself needs libc++ in a C++ view."""
+    path = os.path.join(sdk, "usr", "include", "simd", "math.h")
+    decls = [m for m in SIMD_DECL_RE.finditer(open(path).read())] if os.path.isfile(path) else []
+    if not any(m.group(1) in imported for m in decls): return []
+    body = "#include <simd/vector_types.h>\n" + "".join(m.group(0) + "\n" for m in decls)
+    out = os.path.join(HERE, "build", "simd_math_%s.h" % hashlib.sha256(body.encode()).hexdigest()[:16])
+    if not os.path.isfile(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        open(out + ".tmp%d" % os.getpid(), "w").write(body); os.replace(out + ".tmp%d" % os.getpid(), out)
+    return [out]
+
 def declared_names(sdk: str, headers: list) -> tuple[set, list]:
     """C identifiers declared as functions or extern data by the umbrella headers (x86-64 view); usable headers: those that parse as C++ next to the base headers (an Objective-C umbrella such as Foundation.h preprocesses but does not)."""
     with concurrent.futures.ThreadPoolExecutor(BUILD_JOBS) as pool:
@@ -1407,6 +1424,41 @@ def declared_names(sdk: str, headers: list) -> tuple[set, list]:
     fn = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", r.stdout))
     data = set(re.findall(r"\bextern\b[^;(){}]*?\b([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:__attribute__|__asm|;)", r.stdout))
     return fn | data, usable
+
+def abi_spelling(t: object, ci: object) -> str | None:
+    """A C type spelled as its x86-64 ABI equivalent (same-width integer, void*, float, double, a _Complex of them), else None:
+    a struct or union by value, a function or block pointer (it needs a typed bridge), long double, a vector."""
+    K = ci.TypeKind; t = t.get_canonical()
+    if t.kind == K.ENUM: t = t.get_declaration().enum_type.get_canonical()
+    if t.kind == K.VOID: return "void"
+    if t.kind == K.BOOL: return "bool"
+    if t.kind in (K.FLOAT, K.DOUBLE): return t.spelling
+    if t.kind in (K.CHAR_S, K.SCHAR, K.SHORT, K.INT, K.LONG, K.LONGLONG): return "int%d_t" % (8 * t.get_size())
+    if t.kind in (K.CHAR_U, K.UCHAR, K.USHORT, K.UINT, K.ULONG, K.ULONGLONG): return "uint%d_t" % (8 * t.get_size())
+    if t.kind == K.POINTER: return None if t.get_pointee().get_canonical().kind in (K.FUNCTIONPROTO, K.FUNCTIONNOPROTO) else "void*"
+    if t.kind == K.COMPLEX: return {K.FLOAT: "float _Complex", K.DOUBLE: "double _Complex"}.get(t.element_type.get_canonical().kind)
+    return None
+
+def c_view_header(sdk: str, headers: list, wanted: set, defines: list) -> list:
+    """[a generated header] declaring the wanted functions that headers declare in a C view only (a C++ view needs libc++, such as
+    Accelerate's <complex>), each type spelled by abi_spelling; a function abi_spelling cannot spell stays undeclared. [] when none."""
+    import clang.cindex as ci
+    res, decls = run([CLANG, "-print-resource-dir"]).stdout.strip(), {}
+    for h in headers:
+        tu = ci.Index.create().parse("cview.c", args=["-x", "c", "-isysroot", sdk, "-target", "x86_64-apple-macos11", "-resource-dir", res] + defines,
+                                     unsaved_files=[("cview.c", "#include <%s>\n" % h)], options=ci.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES)
+        if any(d.severity >= ci.Diagnostic.Error for d in tu.diagnostics): continue   # not C (an Objective-C umbrella)
+        for c in tu.cursor.get_children():
+            if c.kind != ci.CursorKind.FUNCTION_DECL or c.spelling not in wanted or c.spelling in decls or c.type.is_function_variadic(): continue
+            sp = [abi_spelling(c.type.get_result(), ci)] + [abi_spelling(a, ci) for a in c.type.argument_types()]
+            if None not in sp: decls[c.spelling] = "%s %s(%s);" % (sp[0], c.spelling, ", ".join(sp[1:]) or "void")
+    if not decls: return []
+    body = "#include <stdint.h>\n" + "".join(decls[n] + "\n" for n in sorted(decls))
+    out = os.path.join(HERE, "build", "cview_%s.h" % hashlib.sha256(body.encode()).hexdigest()[:16])
+    if not os.path.isfile(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+        open(out + ".tmp%d" % os.getpid(), "w").write(body); os.replace(out + ".tmp%d" % os.getpid(), out)
+    return [out]
 
 def c_prototypes(sdk: str, headers: list) -> dict[str, str]:
     """C function name -> type spelling as the umbrella headers declare it (libclang, C++ view without libc++). A V8 build's host TU includes libc++, whose C wrapper headers overload some C names (sqrt, abs, memchr), so its bridges select the C declaration by this type."""
@@ -1839,7 +1891,12 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     weak = {n for _a, n, _ad, w in host_binds if w}
     extra = {**{n: (None, p) for n, p in host_files.items()}, **host_extra}
     hdrs, link_flags = framework_headers(sdk, host_libs(images), extra)
+    hdrs += simd_math_header(sdk, {n[1][1:] for n in names})
     declared, usable = declared_names(sdk, hdrs)
+    wanted = {n[1][1:].partition("$")[0] for n in names if n[1].startswith("_")} - declared
+    lapack = ["-DACCELERATE_NEW_LAPACK"] if any("$NEWLAPACK" in n[1] for n in names) else []
+    cview = c_view_header(sdk, [h for h in hdrs if h not in usable and not os.path.isabs(h)], wanted, lapack) if wanted else []
+    if cview: hdrs += cview; declared, usable = declared_names(sdk, hdrs)
     allp = c_prototypes(sdk, BASE_HEADERS + [h for h in usable if h not in BASE_HEADERS])
     gone = unavailable_names(sdk, BASE_HEADERS + [h for h in usable if h not in BASE_HEADERS])
     declared = declared - {n[1][1:] for n in names if n[1][1:] in gone}  # an import the SDK marks unavailable: resolved by name

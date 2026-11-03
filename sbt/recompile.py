@@ -580,6 +580,7 @@ def xname(name: str) -> str:
 def writes(ins: object) -> set:
     """Integer registers (canonical x names) one instruction writes; calls clobber x0-x18 and x30."""
     if ins.mnemonic in CALLS: return CALL_CLOBBER
+    if ins.mnemonic == DATA_MNEMONIC: return set()                      # a skipdata word has no operands; reaching it traps
     return {xname(ins.reg_name(r)) for r in ins.regs_access()[1]}
 
 def jump_edges(insns: list) -> set:
@@ -1117,7 +1118,7 @@ def path_values(succs: list, entries: list[int], rejoin: frozenset, calls: list[
 
 def sp_after(ins: object, d: int | None) -> int | None:
     """sp's offset from its value at the function's entry after ins, from d before it (None: unknown): sub/add sp, sp, #imm and sp-based writeback are followed, any other write of sp loses it."""
-    if d is None or "sp" not in (ins.reg_name(r) for r in ins.regs_access()[1]): return d
+    if d is None or "sp" not in writes(ins): return d
     ops, mem = ins.operands, [o for o in ins.operands if o.type == ARM64_OP_MEM]
     if ins.mnemonic in ("add", "sub") and len(ops) == 3 and ops[2].type == ARM64_OP_IMM and ins.reg_name(ops[1].reg) == "sp":
         v = ops[2].imm << (ops[2].shift.value if ops[2].shift.type == ARM64_SFT_LSL else 0)
@@ -1128,8 +1129,9 @@ def sp_after(ins: object, d: int | None) -> int | None:
 
 def saved_by(ins: object, d: int | None) -> int:
     """Mask of the callee-saved registers ins stores below sp's entry value, a prologue save (d: sp_after's offset before ins)."""
+    if d is None or ins.mnemonic not in SAVE_OPS: return 0
     mem = [o for o in ins.operands if o.type == ARM64_OP_MEM]
-    if d is None or ins.mnemonic not in SAVE_OPS or not mem or ins.reg_name(mem[0].mem.base) != "sp" or mem[0].mem.index: return 0
+    if not mem or ins.reg_name(mem[0].mem.base) != "sp" or mem[0].mem.index: return 0
     if d + (0 if ins.post_index else mem[0].mem.disp) >= 0: return 0
     names = [ins.reg_name(o.reg) for o in ins.operands if o.type == ARM64_OP_REG]
     return mask_of("gr_x" + r[1:] if r[0] == "x" else "gr_v" + r[1:] for r in names if r[0] in "xdq" and r[1:].isdigit()) & ABI_CS

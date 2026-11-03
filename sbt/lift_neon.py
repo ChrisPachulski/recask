@@ -69,7 +69,7 @@ ELEM = {"add": ("{a}+{b}", "u"), "sub": ("{a}-{b}", "u"), "mul": ("(uint64_t){a}
         **{"fcvt%s%s" % (r, u): ("n_cvt%s((double)n_frint{S}({fa},%d),{E})" % (u, k), "u")
            for r, k in (("a", 0), ("m", 1), ("p", 2), ("n", 4)) for u in "su"}}
 HALF_F32 = {"fmax", "fmin", "fmaxnm", "fminnm", "frinta", "frintm", "frintp", "frintz", "frintn", "frintx", "frinti"}
-SCALAR = {"shl", "ushr", "sshr", "sli", "sri", "cmeq", "fmax", "fmin", "frintn", "frintx", "frinti", "frecpe", "frsqrte",
+SCALAR = {"shl", "ushr", "sshr", "sli", "sri", "cmeq", "cmhi", "cmhs", "cmgt", "cmge", "fmax", "fmin", "frintn", "frintx", "frinti", "frecpe", "frsqrte",
           "frecps", "frsqrts", "sqdmulh", "sqrdmulh", "frintz", "srshr", "urshr", "srsra", "ursra"}  # scalar forms lift_scalar does not claim
 REG_ONLY = {"sqshl", "srshl", "urshl"}                                 # register-shift forms; the #imm forms differ
 AES_OP = {"aese": 0, "aesd": 1, "aesmc": 2, "aesimc": 3}
@@ -434,6 +434,7 @@ def lift_pairwise(ins: object, m: str, ops: list) -> str:
     """addp/faddp vector: element j = op(concat(a,b)[2j], concat(a,b)[2j+1])."""
     d, a, b = vinfo(ins, ops[0]), vinfo(ins, ops[1]), vinfo(ins, ops[2])
     e, n = d[2], d[3]
+    if m == "faddp" and e == 16: raise NotImplementedError("neon:faddp.16")   # half precision: a loud stop, like the other f16 arithmetic
     cat = [("a", k) for k in range(n)] + [("b", k) for k in range(n)]
     body = []
     for j in range(n):
@@ -455,6 +456,7 @@ def lift_reduce(ins: object, m: str, ops: list) -> str:
         while len(xs) > 1: xs = ["n_%s%d(%s,%s)" % (FREDUCE[m], e, xs[k], xs[k + 1]) for k in range(0, len(xs), 2)]
         return finish([("a", a[1])], "{0}", ["_r.f%d[0]=%s;" % (e, xs[0])], ed, d[1])
     if m == "faddp":
+        if e == 16: raise NotImplementedError("neon:faddp.16")         # half precision: a loud stop, like the other f16 arithmetic
         body = ["_r.f%d[0]=n_fadd%d(_a.f%d[0],_a.f%d[1]);" % (e, e, e, e)]
     else:
         signed = m in ("saddlv", "smaxv", "sminv")

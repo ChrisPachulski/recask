@@ -13,7 +13,7 @@ LSE_OPS = ("ldadd", "ldclr", "ldset", "ldeor", "swp", "cas", "stadd", "stclr", "
 ORDERS = ("", "a", "l", "al")
 SIZES = ("", "b", "h")
 LSE_RE = re.compile(r"^(%s)(al|a|l)?(b|h)?$" % "|".join(LSE_OPS))
-ORD_RE = re.compile(r"^(ldar|ldapr|stlr)(b|h)?$")
+ORD_RE = re.compile(r"^(ldar|ldapr|stlr|ldapur|stlur)(b|h)?$")
 RMW_ORDER = {"": "__ATOMIC_RELAXED", "a": "__ATOMIC_ACQUIRE", "l": "__ATOMIC_RELEASE", "al": "__ATOMIC_SEQ_CST"}
 CAS_FAIL = {"": "__ATOMIC_RELAXED", "a": "__ATOMIC_ACQUIRE", "l": "__ATOMIC_RELAXED", "al": "__ATOMIC_SEQ_CST"}
 RMW_FN = {"ldadd": "__atomic_fetch_add", "ldclr": "__atomic_fetch_and", "ldset": "__atomic_fetch_or",
@@ -23,15 +23,15 @@ LSE_CLAIM = {op + o + s for op in LSE_OPS for o in ORDERS for s in SIZES
 FP_UNARY = {"fabs", "fneg", "fsqrt", "frinta", "frintm", "frintp", "fcvt"}
 FP_BINARY = {"fadd", "fsub", "fmul", "fdiv", "fnmul", "fabd", "fmaxnm", "fminnm"}
 FP_FMA = {"fmadd": (False, False), "fmsub": (False, True), "fnmadd": (True, True), "fnmsub": (True, False)}  # (neg addend, neg n)
-FP_TOINT = {"fcvtas": (0, 0), "fcvtms": (1, 0), "fcvtmu": (1, 1), "fcvtps": (2, 0), "fcvtpu": (2, 1),
-            "fcvtzs": (3, 0), "fcvtzu": (3, 1)}                         # (rounding: 0 ties-away, 1 floor, 2 ceil, 3 trunc; unsigned)
+FP_TOINT = {"fcvtas": (0, 0), "fcvtau": (0, 1), "fcvtns": (4, 0), "fcvtnu": (4, 1), "fcvtms": (1, 0), "fcvtmu": (1, 1), "fcvtps": (2, 0), "fcvtpu": (2, 1),
+            "fcvtzs": (3, 0), "fcvtzu": (3, 1)}                         # (rounding: 0 ties-away, 1 floor, 2 ceil, 3 trunc, 4 ties-even; unsigned)
 FRINT_MODE = {"frinta": 0, "frintm": 1, "frintp": 2}
 CASP_RE = re.compile(r"^casp(al|a|l)?$")
 CRC = {"crc32" + s: (0xEDB88320, n) for s, n in (("b", 1), ("h", 2), ("w", 4), ("x", 8))}
 CRC.update({"crc32c" + s: (0x82F63B78, n) for s, n in (("b", 1), ("h", 2), ("w", 4), ("x", 8))})   # reflected polynomials
 MNEMONICS: set = ({"brk", "ccmp", "ccmn", "ngc", "ngcs", "smnegl", "umnegl", "fmov", "fcsel", "fccmp", "fccmpe", "mrs", "msr"}
                   | FP_UNARY | FP_BINARY | set(FP_FMA) | set(FP_TOINT) | LSE_CLAIM | set(CRC)
-                  | {"casp" + o for o in ORDERS} | {b + s for b in ("ldar", "ldapr", "stlr") for s in SIZES})
+                  | {"casp" + o for o in ORDERS} | {b + s for b in ("ldar", "ldapr", "stlr", "ldapur", "stlur") for s in SIZES})
 SIGN = {32: "0x80000000u", 64: "0x8000000000000000ULL"}
 C_HELPERS = r"""
 #define S_GEN(N,T,F,SG,EXPM,QB,FMA,SQRT,RND,FLR,CEIL) \
@@ -84,7 +84,7 @@ static inline uint32_t s_cvt_ds(uint64_t a){
   double x=s_tf64(a); float q=(float)x; if(__builtin_expect(q!=q,0))q=s_nancvt_ds(x); return s_fu32(q);}
 static inline uint64_t s_f2i(double v,int md,int bits,int uns){
   if(v!=v)return 0;
-  double r=md==0?round(v):md==1?floor(v):md==2?ceil(v):trunc(v);
+  double r=md==0?round(v):md==1?floor(v):md==2?ceil(v):md==3?trunc(v):rint(v);
   if(uns){ if(r<=0)return 0;
     if(r>=(bits==64?18446744073709551616.0:4294967296.0))return bits==64?~0ULL:0xffffffffULL;
     return (uint64_t)r; }
@@ -212,13 +212,13 @@ def lift_sysreg(ins: object, m: str, ops: list) -> str:
     raise NotImplementedError("sysreg %s %s" % (m, name))
 
 def lift_ordered(ins: object, m: str, ops: list) -> str:
-    """ldar*/stlr* as seq_cst (ARM RCsc), ldapr* as acquire (RCpc); w/b/h loads zero-extend."""
+    """ldar*/stlr* as seq_cst (ARM RCsc), ldapr*/ldapur* as acquire (RCpc), stlur* as stlr*; w/b/h loads zero-extend."""
     op, size = ORD_RE.match(m).groups()
     k, i, rw = ireg(ins, ops[0])
     w = {"b": 8, "h": 16}.get(size, rw)
     ct = "uint%d_t" % w
     addr = mem_addr(ins, ops[1], None)[0]
-    if op == "stlr":
+    if op in ("stlr", "stlur"):
         return "__atomic_store_n((%s*)(%s), (%s)(%s), __ATOMIC_SEQ_CST);" % (ct, addr, ct, rd(k, i, rw))
     order = "__ATOMIC_SEQ_CST" if op == "ldar" else "__ATOMIC_ACQUIRE"
     return wr(k, i, rw, "__atomic_load_n((%s*)(%s), %s)" % (ct, addr, order))
@@ -253,7 +253,7 @@ def lift_fcmp_cond(ins: object, ops: list) -> str:
             "c->VF=(_x!=_x||_y!=_y); } else { %s }" % (CC[ins.cc], a, b, set_nzcv(ops[2].imm)))
 
 def lift_fp_toint(ins: object, m: str, ops: list) -> str:
-    """fcvt{a,m,p,z}{s,u}: scale by 2^fbits, round, saturate to the integer width, NaN -> 0."""
+    """fcvt{a,m,n,p,z}{s,u}: scale by 2^fbits, round, saturate to the integer width, NaN -> 0."""
     dk, di, dw = ireg(ins, ops[0])
     _, si, sw = vreg(ins, ops[1])
     md, uns = FP_TOINT[m]

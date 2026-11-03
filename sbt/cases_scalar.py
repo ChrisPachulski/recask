@@ -146,7 +146,7 @@ for _w in (32, 64):
                   "vregs": {r: vinit(_w, table(_w)[("sn", "qnn", "one", "nz", "dn", "inf")[r % 6]] if r % 3 else 0) for r in range(24)}})
     for _m in ("fccmp", "fccmpe"):
         CASES += fccmp_cases(_m, _w)
-for _m in ("fcvtas", "fcvtms", "fcvtmu", "fcvtps", "fcvtpu", "fcvtzs", "fcvtzu"):
+for _m in ("fcvtas", "fcvtau", "fcvtns", "fcvtnu", "fcvtms", "fcvtmu", "fcvtps", "fcvtpu", "fcvtzs", "fcvtzu"):
     for _r in ("w", "x"):
         for _w in (32, 64):
             CASES += toint_cases(_m, _r, _w)
@@ -195,4 +195,15 @@ CASES += [{"name": "ldadd Rt==Rs, swpal base==Rt", "asm": "ldadd w8, w8, [x0]\ns
                   "stlr w16, [x17]\nstlr xzr, [x18]\nstlr wzr, [x19]\nldar x21, [x21]\nldapr x22, [x22]\nldaprb w23, [sp]\nret",
            "regs": {0: DATA, 1: DATA + 8, 10: 0x1122334455667788, 11: DATA + 0x20, 12: 0xFFFFFFFFFFFFFFAB, 13: DATA + 0x28,
                     14: 0x1234CDEF, 15: DATA + 0x30, 16: 0xFFFFFFFF89ABCDEF, 17: DATA + 0x38, 18: DATA + 0x40,
-                    19: DATA + 0x10, 21: DATA + 0x18, 22: DATA, "sp": DATA + 0x48}}]
+                    19: DATA + 0x10, 21: DATA + 0x18, 22: DATA, "sp": DATA + 0x48}},
+          {"name": "ldapur/stlur unscaled offsets", "mem": MEM_INIT,
+           "asm": "ldapur x2, [x0, #8]\nldapurb w3, [x0, #-1]\nldapurh w4, [x0, #3]\nldapur w5, [x1, #-4]\nldapurb w6, [x1, #255]\n"
+                  "stlur x10, [x11, #-8]\nstlurb w12, [x13, #5]\nstlurh w14, [x15, #-2]\nstlur w16, [x17, #1]\nstlur xzr, [x18, #16]\n"
+                  "ldapur x7, [x11, #-8]\nldapurb w8, [x13, #5]\nret",
+           "regs": {0: DATA + 8, 1: DATA + 0x10, 10: 0x1122334455667788, 11: DATA + 0x28, 12: 0xFFFFFFFFFFFFFFAB, 13: DATA + 0x28,
+                    14: 0x1234CDEF, 15: DATA + 0x34, 16: 0xFFFFFFFF89ABCDEF, 17: DATA + 0x38, 18: DATA + 0x30}},
+          {"name": "cmhi/cmhs/cmgt/cmge scalar d", "v": True,
+           "asm": "cmhi d0, d1, d2\ncmhi d3, d2, d1\ncmhs d4, d1, d1\ncmhs d5, d2, d1\ncmgt d6, d1, d2\ncmgt d7, d2, d1\n"
+                  "cmge d8, d2, d2\ncmge d9, d1, d2\ncmhi d10, d11, d12\nret",
+           "vregs": {0: (LO_JUNK, HI), 1: (0xFFFFFFFFFFFFFFF0, HI), 2: (0x10, HI), 3: (LO_JUNK, HI), 4: (LO_JUNK, HI), 5: (LO_JUNK, HI),
+                     6: (LO_JUNK, HI), 7: (LO_JUNK, HI), 8: (LO_JUNK, HI), 9: (LO_JUNK, HI), 10: (LO_JUNK, HI), 11: (5, HI), 12: (5, 7)}}]
