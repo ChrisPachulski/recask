@@ -1,0 +1,12 @@
+MLX 0.32.4, device cpu, 600 points, 64 hidden units
+step   0  loss 1.4647
+step  50  loss 0.6602
+step 100  loss 0.5737
+step 150  loss 0.4708
+step 200  loss 0.3895
+step 250  loss 0.3009
+step 300  loss 0.2430
+step 350  loss 0.2035
+step 400  loss 0.1750
+accuracy 0.9667
+class probabilities at (0.5, -0.25): 0.9083 0.0812 0.0106

@@ -22,12 +22,13 @@ In the code and these docs, the translated arm64 program is the guest and the In
 
 - **Native code, not emulation** — each arm64 function becomes a C function over a CPU-state struct, and the output executes no arm64 code.
 - **Byte-identical on real software** — the translated SQLite shell matches a native x86-64 build byte for byte, and reproduces SQLite's own speedtest1 hash ([the run](#example-sqlite-on-an-intel-mac)).
-- **Close to native speed** — on an Intel iMac that SQLite suite takes 0.76 s translated and 0.5 s native.
+- **Software that ships only for Apple silicon** — LLVM's official clang 23 builds SQLite on an Intel iMac, and Apple's MLX trains a network there, matching Apple silicon ([the runs](#example-software-that-ships-only-for-apple-silicon)).
+- **Measured speed** — SQLite's suite takes 1.5 times as long as a native build; the translated clang takes 3.3 times as long as Apple's native clang to compile SQLite.
 - **The whole load graph** — the program and the arm64 dylibs it links become one `translated` executable; a dependency with an x86-64 slice is used natively.
 - **Typed calls into macOS** — C functions the SDK headers declare are bridged to the x86-64 calling convention with their prototypes' types; `printf` and `objc_msgSend` get hand-written bridges.
 - **Objective-C, blocks, Swift and C++** — guest classes register with the host Objective-C runtime, Swift imports are bridged with swiftc's own signatures, and C++ exceptions unwind.
-- **Loud stops, never quiet guesses** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line and exit status 70.
-- **Proved against native** — most of its 26 test beds compare a translated arm64 build with a native x86-64 build of the same program; single instructions are checked against the Unicorn emulator.
+- **Loud stops** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line and exit status 70; the known gaps that change output instead are in [docs/limits.md](docs/limits.md).
+- **Tested against native** — most of its 26 test beds compare a translated arm64 build with a native x86-64 build of the same program, and a bed exits 1 on any mismatch; single instructions are checked against the Unicorn emulator.
 
 ## Install
 
@@ -37,7 +38,7 @@ You need:
   `sysctl machdep.cpu.features machdep.cpu.leaf7_features machdep.cpu.extfeatures` lists them (look for AVX2, BMI1, BMI2, FMA, F16C, AES, PCLMULQDQ, POPCNT and LZCNT).
 - **Xcode Command Line Tools.** The translator runs `/usr/bin/clang` and `/usr/bin/clang++`, and through `xcrun` it runs `swiftc` and `swift-demangle` and finds the SDK.
 - **Python 3.9 or newer**, with the packages in `requirements.txt` (capstone, libclang and unicorn).
-- **CMake**, only for building the guest C++ runtime.
+- **CMake**, only for building the guest C++ runtime and for the MLX example.
 
 Create the Python environment at the repository root, where the scripts' usage lines expect `sbtenv/bin/python`:
 
@@ -94,6 +95,23 @@ Three things to know before your own program:
 - **Keep `out` where it is.** `translated` reads the guest images `out/image0.bin`, `out/image1.bin` and so on from their absolute paths each time it starts.
 - **`--ui-guard-off` is the only option.** It switches off the UI guard described under [Limits](#limits); any other `--` option is refused with the usage line.
 
+## Example: software that ships only for Apple silicon
+
+Two programs with no Intel build to fall back on, both under licenses that allow translation, run on an Intel iMac (Core i9-10910).
+
+**LLVM's clang 23.** LLVM publishes its macOS release of clang 23.1.4 for Apple silicon only.
+[examples/clang/run.sh](examples/clang/run.sh) downloads that release at a pinned hash, translates `clang-23`, and builds the SQLite 3.54.1 shell for x86-64 with it.
+The translation takes about 45 minutes and 24 GB of memory on this Mac, and leaves no instruction unsupported.
+
+- The `sqlite3` it builds gives the same output as one that Apple's native clang builds from the same preprocessed source, on suite.sql (in memory and on disk) and mandelbrot.sql.
+- From the same preprocessed source, the objects it writes are byte-identical to the ones clang 23 writes running natively on an Apple-silicon Mac. Run there, the script prints the hashes to compare.
+- It compiles `sqlite3.i` in 57 s on an otherwise idle iMac; Apple's native clang 17, a different version, takes 17 s.
+
+**Apple's MLX.** MLX supports Apple silicon only: its build refuses x86-64 macOS unless an opt-in flag forces it, and its Metal backend fails on this iMac's AMD GPU.
+[examples/mlx/run.sh](examples/mlx/run.sh) builds MLX 0.32.4 from Apple's source for arm64 with its CPU backend, translates [a program](examples/mlx/spiral.cpp) that trains a small network on a three-arm spiral, and compares its output with a run on an Apple-silicon Mac.
+Loss falls from 1.4647 to 0.1750 over 400 steps and accuracy reaches 0.9667, identical to the last printed digit; the translated run takes about 3 s.
+MLX's float16, float64 and complex kernels hold about 5,600 instructions Recask stops on; the program never reaches them.
+
 ## Example: SQLite on an Intel Mac
 
 The SQLite 3.54.1 shell, built for arm64 only on an Apple-silicon Mac, translated and run on an Intel iMac (Core i9-10910).
@@ -117,7 +135,7 @@ With a profile from a run of speedtest1's SQL (`GDYLD_PGO`, [docs/environment.md
 - **Typed calls into macOS** — a call to a C function that the SDK headers declare is bridged from the Apple arm64 calling convention to the x86-64 one, with the types of its prototype; calls with special rules, such as `printf` or `objc_msgSend`, have hand-written bridges.
 - **Objective-C, blocks and Swift** — guest classes are registered with the host Objective-C runtime, guest blocks become host blocks, and Swift imports are bridged with signatures read from swiftc's own LLVM IR.
 - **C++ and its exceptions** — the C++ runtime a program links is replaced by arm64 builds of libc++, libc++abi and libunwind, translated with the program.
-- **Loud stops** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line on stderr and exit status 70.
+- **Loud stops** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line on stderr and exit status 70. A few known gaps, such as a guest reading back a callback pointer it gave the host, change output instead; [docs/limits.md](docs/limits.md) lists them.
 - **Differential tests** — most test beds build each program for arm64 and x86-64 and compare the translated run with the native one.
 
 </details>
