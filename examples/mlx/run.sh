@@ -1,5 +1,5 @@
 #!/bin/bash
-# Apple's MLX 0.32.4 on an Intel Mac. MLX supports Apple silicon only: its build refuses x86-64 macOS, and its Metal
+# Apple's MLX 0.32.4 on an Intel Mac. MLX's build refuses x86-64 macOS unless MLX_ENABLE_X64_MAC is set, and its Metal
 # backend needs an Apple GPU. This builds MLX from Apple's source for arm64 with the CPU backend, builds spiral.cpp
 # against it, translates the program, and compares the training run with expected.txt, recorded on an Apple-silicon Mac.
 # Usage: examples/mlx/run.sh [work directory]; needs cmake and git; exits 1 if the output differs.
