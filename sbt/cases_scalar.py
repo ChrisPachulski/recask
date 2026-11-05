@@ -48,8 +48,8 @@ CCMP_ROWS = [("ccmp", "x", "reg", 5, 5, "lt", 0), ("ccmp", "x", "reg", 0x8000000
              ("ccmn", "w", "imm", 0x7FFFFFFF, 1, "eq", 4), ("ccmn", "x", "imm", 0xFFFFFFFFFFFFFFFF, 1, "lt", 0),
              ("ccmn", "x", "imm", 0x7FFFFFFFFFFFFFFF, 1, "ge", 8), ("ccmn", "x", "reg", 0x7FFFFFFFFFFFFFFF, 1, "mi", 0),
              ("ccmn", "w", "reg", 0x80000000, 0x80000000, "lt", 0)]
-LSE_RMW = ["ldadd", "ldclr", "ldset", "ldeor", "swp", "cas"]
-LSE_ST = ["stadd", "stclr", "stset", "steor"]
+LSE_RMW = ["ldadd", "ldclr", "ldset", "ldeor", "ldsmax", "ldsmin", "ldumax", "ldumin", "swp", "cas"]
+LSE_ST = ["stadd", "stclr", "stset", "steor", "stsmax", "stsmin", "stumax", "stumin"]
 MEM_INIT = bytes.fromhex("ffeeddccbbaa9988" "f0debc9a78563412" "0100000000000080" "fe7fffff7fffffff") * 2
 
 ###############
@@ -107,6 +107,15 @@ def ccmp_cases() -> list:
                     "asm": "cmp x0, x1\n%s %s2, %s, #%d, %s\nret" % (m, r, op2, nz, cc), "regs": {0: 1, 1: 2, 2: a, 3: b}})
     return out
 
+def signed_minmax_mem(op: str, regs: dict) -> bytes:
+    """MEM_INIT after lse_cases' four signed max/min (b/h/w/x at x0..x3 with x10..x13), by the ARM ARM's datasize-signed compare."""
+    m, f = bytearray(MEM_INIT), max if "max" in op else min
+    for k, w in enumerate((8, 16, 32, 64)):
+        sx = lambda v: (v & ((1 << w) - 1)) - (((v >> (w - 1)) & 1) << w)
+        a, b = 16 * k, 16 * k + w // 8
+        m[a:b] = (f(sx(int.from_bytes(m[a:b], "little")), sx(regs[10 + k])) & ((1 << w) - 1)).to_bytes(w // 8, "little")
+    return bytes(m)
+
 def lse_cases(op: str) -> list:
     """Each order of one LSE family, all four widths per case on distinct addresses; regs and memory compared."""
     out = []
@@ -120,6 +129,7 @@ def lse_cases(op: str) -> list:
         if op == "cas": regs.update({10: 0xABCD00FF, 11: 0x1234, 12: 0x78563412, 13: 0xFFFFFF7FFFFF7FFE})  # b,x match; h,w miss
         regs.update({20: 0xA5A5A5A5A5A5A5A5, 21: 0x5A5A5A5A5A5A5A5A, 22: 0x1111111111111111, 23: 0x2222222222222222})
         out.append({"name": "%s%s b/h/w/x" % (op, o), "asm": "\n".join(asm + ["ret"]), "regs": regs, "mem": MEM_INIT})
+        if op[2:5] in ("sma", "smi"): out[-1]["mem_spec"] = signed_minmax_mem(op, regs)                    # Unicorn 2.1.4 compares b/h/w unsigned
     return out
 
 ###############
@@ -184,6 +194,21 @@ CASES += [{"name": "ngc x C=0/1", "asm": "cmp x0, x1\nngc x2, x3\ncmp x1, x0\nng
           {"name": "brk (unreachable, lifts+compiles)", "asm": "b 1f\nbrk #1\n1:\nmov x0, #7\nret"}]
 for _op in LSE_RMW + LSE_ST:
     CASES += lse_cases(_op)
+CASES += [{"name": "ldaxp/stlxp x retry loop", "asm": "1:\nldaxp x0, x1, [x8]\nstlxp w9, x2, x3, [x8]\ncbnz w9, 1b\nret",
+           "regs": {8: DATA + 0x10, 2: 0x0123456789ABCDEF, 3: 0xFEDCBA9876543210}, "mem": MEM_INIT},
+          {"name": "ldxp/stxp w retry loop", "asm": "1:\nldxp w0, w1, [x8]\nstxp w9, w2, w3, [x8]\ncbnz w9, 1b\nret",
+           "regs": {8: DATA + 0x18, 0: LO_JUNK, 1: LO_JUNK, 2: 0xAAAAAAAA12345678, 3: 0xBBBBBBBB9ABCDEF0}, "mem": MEM_INIT},
+          {"name": "ld(a)xr/st(l)xr b/h/w/x", "mem": MEM_INIT,
+           "asm": "ldxrb w0, [x8]\nstxrb w9, w2, [x8]\nldaxrh w1, [x10]\nstlxrh w11, w3, [x10]\nldxr w4, [x12]\nstxr w13, w5, [x12]\n"
+                  "ldaxr x6, [x14]\nstlxr w15, x7, [x14]\nret",
+           "regs": {8: DATA, 10: DATA + 0x8, 12: DATA + 0x10, 14: DATA + 0x18, 0: LO_JUNK, 1: LO_JUNK, 4: LO_JUNK,
+                    2: 0xFFFFFFFFFFFFFF5A, 3: 0xFFFFFFFFFFFF1234, 5: 0x1111111187654321, 7: 0x0F1E2D3C4B5A6978}},
+          {"name": "store-exclusive fails: no load, clrex, changed value, other address", "mem": MEM_INIT,
+           "asm": "stxr w9, x2, [x8]\nldxr x0, [x8]\nclrex\nstxr w10, x2, [x8]\nldxr x1, [x8]\nstr x3, [x8]\n"
+                  "stxr w11, x2, [x8]\nldxr x4, [x8]\nstxr w12, x2, [x16]\nstxr w13, x2, [x8]\nret",
+           "regs": {8: DATA, 16: DATA + 0x20, 2: 0x2222222222222222, 3: 0x3333333333333333}},
+          {"name": "ldxr base is dest", "asm": "ldxr x8, [x8]\nldaxp x10, x11, [x12]\nstlxp w13, x11, x10, [x12]\nret",
+           "regs": {8: DATA + 0x8, 12: DATA + 0x20}, "mem": MEM_INIT}]
 CASES += [{"name": "ldadd Rt==Rs, swpal base==Rt", "asm": "ldadd w8, w8, [x0]\nswpal x21, x7, [x7]\nldaddal x9, xzr, [x1]\nret",
            "regs": {0: DATA, 8: 0x7, 1: DATA + 8, 9: 3, 7: DATA + 16, 21: 0x99}, "mem": MEM_INIT},
           {"name": "casal base==Rs miss/hit", "asm": "casal x9, x22, [x19]\ncasal x10, x22, [x19]\ncasal w19, w20, [x19]\nret",

@@ -1,6 +1,6 @@
 // swiftc: -parse-as-library
 // IR-only corpus: everyday Swift that makes swiftc call the runtime's fixed-ABI entry points (class casts, unowned
-// references, tuple / foreign / singleton metadata, boxes, uniqueness checks, random, key paths, float parsing), so
+// references, tuple / foreign / singleton metadata, boxes, uniqueness checks, random, #available, key paths, float parsing), so
 // programs outside the corpus find them typed.
 import Foundation
 
@@ -18,6 +18,7 @@ public struct RtResilient { public var date: Date; public var url: URL? }       
 @inline(never) public func unique(_ a: inout RtDerived) -> Bool { isKnownUniquelyReferenced(&a) }
 @inline(never) public func grow(_ a: inout [RtNode], _ n: RtNode) { a.append(n) }   // [class] storage is a bridge object
 @inline(never) public func random() -> Int { Int.random(in: 0..<100) }
+@inline(never) public func available() -> Bool { if #available(macOS 99, *) { return true } else { return false } }   // _stdlib_isOSVersionAtLeast
 @inline(never) public func parse(_ s: String) -> (Double?, Float?) { (Double(s), Float(s)) }
 public struct RtKP { public var a: Int; public var b: [String: Int] }
 @inline(never) public func keypaths(_ k: inout RtKP, _ c: RtDerived) -> (Int, Int) {

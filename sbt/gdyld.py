@@ -113,7 +113,8 @@ BASE_HEADERS = ["stdio.h", "stdlib.h", "string.h", "strings.h", "math.h", "pthre
                 "Block.h", "CommonCrypto/CommonDigest.h", "CommonCrypto/CommonCryptor.h", "CommonCrypto/CommonRandom.h",
                 "mach-o/dyld.h", "aio.h", "libgen.h", "fnmatch.h", "ifaddrs.h", "sys/mount.h", "fts.h", "pwd.h", "iconv.h",
                 "net/if.h", "sys/event.h", "malloc/malloc.h", "poll.h", "sys/sysctl.h", "termios.h",
-                "IOKit/ps/IOPowerSources.h"]                           # prototypes of imports no other base header declares
+                "IOKit/ps/IOPowerSources.h", "IOKit/pwr_mgt/IOPMLib.h", "mach/mach_time.h", "sys/uio.h", "sys/random.h",
+                "mach-o/getsect.h", "CoreAudio/AudioHardwareTapping.h", "CoreAudio/CATapDescription.h"]   # prototypes of imports no other base header declares
 EXTRA_DECLS = ('extern "C" int __cxa_atexit(void (*)(void *), void *, void *);\n'
                'extern "C" { id objc_retain(id); void objc_release(id); id objc_autorelease(id); id objc_retainAutorelease(id);\n'
                'id objc_retainAutoreleasedReturnValue(id); id objc_autoreleaseReturnValue(id); id objc_retainAutoreleaseReturnValue(id);\n'
@@ -133,9 +134,14 @@ EXTRA_DECLS = ('extern "C" int __cxa_atexit(void (*)(void *), void *, void *);\n
                'char* __strncpy_chk(char*, const char*, size_t, size_t); char* __stpncpy_chk(char*, const char*, size_t, size_t);\n'
                'char* __strncat_chk(char*, const char*, size_t, size_t); size_t __strlcpy_chk(char*, const char*, size_t, size_t);\n'
                'size_t __strlcat_chk(char*, const char*, size_t, size_t);\n'
-               'void* voucher_adopt(void*); bool _availability_version_check(uint32_t, const void*); }\n')
-# fortified string functions; libdispatch's voucher_adopt (voucher_t in, retained voucher_t out) and libSystem's
-# _availability_version_check (count, dyld_build_version_t[]: @available), neither in a public header
+               'void* voucher_adopt(void*); bool _availability_version_check(uint32_t, const void*);\n'
+               'int CGSMainConnectionID(void); int CGSSetWindowBackgroundBlurRadius(int, int, int);\n'
+               'int TCCAccessPreflight(const void*, const void*); void TCCAccessRequest(const void*, const void*, void (^)(unsigned char));\n'
+               'bool MRMediaRemoteSendCommand(uint32_t, const void*); }\n')
+# fortified string functions; libdispatch's voucher_adopt (voucher_t in, retained voucher_t out), libSystem's
+# _availability_version_check (count, dyld_build_version_t[]: @available), CoreGraphics' window-server connection and
+# window blur (connection, window number, radius), and the private TCC (service, options[, completion(granted)]) and
+# MediaRemote (command, options) entry points programs dlsym; none in a public header
 HOST_LANG = "objective-c++"                                            # host.cpp: ObjC runtime, blocks, Foundation headers
 NOESCAPE = "__attribute__((noescape))"                                 # a parameter attribute the bridge templates cannot match
 TRAIL_ATTR_RE = re.compile(r"(\s*__attribute__\(\(\w+\)\))+$")         # nothrow etc.: not valid at the end of an alias
@@ -162,6 +168,7 @@ SPECIAL = {"_printf": "sp_printf", "_fprintf": "sp_fprintf", "_vprintf": "sp_vpr
            "_objc_msgSend": "sp_objc_msgSend", "_objc_msgSendSuper2": "sp_objc_msgSendSuper2",   # typed from the runtime
            "_objc_msgSendSuper": "sp_objc_msgSendSuper", "_objc_retainBlock": "sp_objc_retainBlock",
            "__Block_copy": "sp_Block_copy", "__Block_object_assign": "sp_Block_object_assign",    # guest blocks become host blocks
+           "_AudioUnitSetProperty": "sp_AudioUnitSetProperty",                                    # a render / input callback inside the data buffer
            "_NSLog": "sp_NSLog", "_NSLogv": "sp_NSLogv", "_swprintf": "sp_swprintf", "_vswprintf": "sp_vswprintf",
            "___sprintf_chk": "sp_sprintf_chk", "___snprintf_chk": "sp_snprintf_chk", "___vsprintf_chk": "sp_vsprintf_chk",
            "___vsnprintf_chk": "sp_vsnprintf_chk", "__NSGetExecutablePath": "sp_NSGetExecutablePath",   # the guest's path
@@ -1514,8 +1521,8 @@ def objc_variadics(sdk: str, headers: list) -> list[tuple]:
                                  options=ci.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES)
     out = set()
     for c in tu.cursor.get_children():
-        if c._kind_id not in (11, 12, 14): continue                    # @interface, category, @protocol
-        owner = "" if c._kind_id == 14 else c.spelling if c._kind_id == 11 else next((k.spelling for k in c.get_children() if k._kind_id == 42), "")
+        if c._kind_id not in (11, 12, 13): continue                    # @interface, category, @protocol
+        owner = "" if c._kind_id == 13 else c.spelling if c._kind_id == 11 else next((k.spelling for k in c.get_children() if k._kind_id == 42), "")
         if c._kind_id == 12 and not owner: continue                    # a category without its class reference
         for m in c.get_children():
             if m._kind_id in (16, 17):                                 # instance / class method
@@ -1528,6 +1535,12 @@ def fn_pointer(t: object) -> bool:
     import clang.cindex as ci
     c = t.get_canonical()
     return c.kind == ci.TypeKind.POINTER and c.get_pointee().kind in (ci.TypeKind.FUNCTIONPROTO, ci.TypeKind.FUNCTIONNOPROTO)
+
+def blk_pointer(t: object) -> bool:
+    """True for a libclang type that is (a typedef of) a block pointer with a fixed parameter list."""
+    import clang.cindex as ci
+    c = t.get_canonical()
+    return c.kind == ci.TypeKind.BLOCKPOINTER and c.get_pointee().kind == ci.TypeKind.FUNCTIONPROTO and not c.get_pointee().is_function_variadic()
 
 def prop_setter(p: object) -> str | None:
     """Setter selector of an ObjC property cursor (setter= attribute or set<Name>:), None when readonly."""
@@ -1555,7 +1568,7 @@ def vec_rows(m: object) -> set[tuple]:
     if m._kind_id in (16, 17):                                         # method: its encoding names every type in order
         parms = [p.type for p in m.get_children() if p._kind_id == 10]
         return {(m.spelling, enc_key(m.objc_type_encoding))} if any(vec_record(t) for t in [m.result_type] + parms) else set()
-    if m._kind_id != 13 or not vec_record(m.type): return set()       # property: its getter and setter
+    if m._kind_id != 14 or not vec_record(m.type): return set()       # property: its getter and setter
     t = m.objc_type_encoding[1:].split(",")[0]                         # attribute string "T<type>,R,N,..."
     toks = [x.spelling for x in m.get_tokens()]
     g = next((toks[i + 2] for i in range(len(toks) - 3) if toks[i] == "getter" and toks[i + 1] == "="), m.spelling)
@@ -1572,10 +1585,10 @@ def objc_vecrecs(sdk: str, headers: list) -> list[tuple]:
                                  options=ci.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES)
     fatal = [str(d) for d in tu.diagnostics if d.severity >= ci.Diagnostic.Fatal]
     if fatal: raise LookupError("SIMD record scan: the framework headers do not parse: %s" % fatal[0])
-    return sorted({r for c in tu.cursor.get_children() if c._kind_id in (11, 12, 14) for m in c.get_children() for r in vec_rows(m)})
+    return sorted({r for c in tu.cursor.get_children() if c._kind_id in (11, 12, 13) for m in c.get_children() for r in vec_rows(m)})
 
 def objc_fnparams(sdk: str, headers: list) -> list[tuple]:
-    """(class, selector, class method?, parameter index, C++ type) of every ObjC method or property setter the SDK headers declare with a function-pointer parameter (libclang, host.cpp's objective-c++ x86-64 view), sorted by selector: the runtime's encoding calls it an untyped ^?."""
+    """(class, selector, class method?, parameter index, C++ type) of every ObjC method or property setter the SDK headers declare with a function-pointer or block parameter (libclang, host.cpp's objective-c++ x86-64 view), sorted by selector: the runtime's encoding calls them an untyped ^? and @?."""
     import clang.cindex as ci
     if not headers: return []
     res = run([CLANG, "-print-resource-dir"]).stdout.strip()
@@ -1584,14 +1597,15 @@ def objc_fnparams(sdk: str, headers: list) -> list[tuple]:
                                  options=ci.TranslationUnit.PARSE_SKIP_FUNCTION_BODIES)
     out = set()
     for c in tu.cursor.get_children():
-        if c._kind_id not in (11, 12, 14): continue                    # @interface, category, @protocol
-        owner = "" if c._kind_id == 14 else c.spelling if c._kind_id == 11 else next((k.spelling for k in c.get_children() if k._kind_id == 42), "")
+        if c._kind_id not in (11, 12, 13): continue                    # @interface, category, @protocol
+        owner = "" if c._kind_id == 13 else c.spelling if c._kind_id == 11 else next((k.spelling for k in c.get_children() if k._kind_id == 42), "")
         if c._kind_id == 12 and not owner: continue
         for m in c.get_children():
             if m._kind_id in (16, 17):                                 # instance / class method: PARM_DECL children
                 parms = [p for p in m.get_children() if p._kind_id == 10]
-                out |= {(owner, m.spelling, int(m._kind_id == 17), i, p.type.get_canonical().spelling) for i, p in enumerate(parms) if fn_pointer(p.type)}
-            elif m._kind_id == 13 and fn_pointer(m.type) and prop_setter(m):   # property: its setter's only parameter
+                out |= {(owner, m.spelling, int(m._kind_id == 17), i, p.type.get_canonical().spelling) for i, p in enumerate(parms)
+                        if fn_pointer(p.type) or blk_pointer(p.type)}
+            elif m._kind_id == 14 and (fn_pointer(m.type) or blk_pointer(m.type)) and prop_setter(m):   # property: its setter's only parameter
                 out.add((owner, prop_setter(m), int("class" in [t.spelling for t in m.get_tokens()]), 0, m.type.get_canonical().spelling))
     generic = ("void (*)()", "void (*)(void)")                         # IMP-like: the real type comes from elsewhere, stays loud
     return sorted((v for v in out if v[4] not in generic), key=lambda v: (v[1], v[0], v[2], v[3]))
@@ -1629,7 +1643,7 @@ def dl_rows(images: list) -> tuple[list[tuple], list[str]]:
     return rows, [images[0]["host_files"].get(n, n) for n in hosts]
 
 def gen_hpp(dl: list, dlhost: list, fparams: list, vecs: list | None = None) -> str:
-    """gdyld_gen.hpp: GD_DLI and GD_DLHOST (guest dlopen, dlsym, initializers on dlopen), GD_FPARAM (typed ^? method parameters) and GD_VECREC (methods with a record holding a SIMD vector, sorted by selector), included by gbridge.hpp."""
+    """gdyld_gen.hpp: GD_DLI and GD_DLHOST (guest dlopen, dlsym, initializers on dlopen), GD_FPARAM (typed ^? and @? method parameters) and GD_VECREC (methods with a record holding a SIMD vector, sorted by selector), included by gbridge.hpp."""
     if len(dl) > 250: raise ValueError("more than 250 guest images: gbridge's dlopen handle page holds 250")
     types = sorted({r[4] for r in fparams})
     out = ["/* generated by gdyld.py: guest dlopen images, typed function-pointer parameters of ObjC methods */", "#define GD_HAVE_GEN 1"]
@@ -1639,10 +1653,11 @@ def gen_hpp(dl: list, dlhost: list, fparams: list, vecs: list | None = None) -> 
         "  {%s, %s, gd_dls_%d, %d, gd_dlf_%d, %d, gd_dli_%d, %d}" % (json.dumps(i) if i else "nullptr", json.dumps("\n".join(r)), k, len(s), k, len(f), k, len(d))
         for k, (i, r, s, f, d) in enumerate(dl)), len(dl)))
     out.append("static const char* const GD_DLHOST[] = {%s};\nstatic const int GD_NDLHOST = %d;" % (", ".join([json.dumps(h) for h in dlhost] + ["nullptr"]), len(dlhost)))
-    out += ["static uint64_t gd_fpm_%d(uint64_t g) { return (uint64_t)(uintptr_t)gd::to_host_fn<%s>(g); }" % (i, t) for i, t in enumerate(types)]
+    out += ["static const char* gd_fpe_%d() { return gd_benc<%s>::get(); }" % (i, t) if "(^)" in t else
+            "static uint64_t gd_fpm_%d(uint64_t g) { return (uint64_t)(uintptr_t)gd::to_host_fn<%s>(g); }" % (i, t) for i, t in enumerate(types)]
     out.append("static const FParam GD_FPARAM[] = {\n%s\n};\nstatic const int GD_NFPARAM = %d;" % (",\n".join(
-        ["  {%s, %s, %d, %d, gd_fpm_%d}" % (json.dumps(c), json.dumps(s), cm, a, types.index(t)) for c, s, cm, a, t in fparams]
-        + ["  {nullptr, nullptr, 0, 0, nullptr}"]), len(fparams)))
+        ["  {%s, %s, %d, %d, %s}" % (json.dumps(c), json.dumps(s), cm, a, "nullptr, gd_fpe_%d" % types.index(t) if "(^)" in t else "gd_fpm_%d, nullptr" % types.index(t))
+         for c, s, cm, a, t in fparams] + ["  {nullptr, nullptr, 0, 0, nullptr, nullptr}"]), len(fparams)))
     out.append("static const VecRec GD_VECREC[] = {\n%s\n};\nstatic const int GD_NVECREC = %d;" % (",\n".join(
         ["  {%s, %s}" % (json.dumps(s), json.dumps(e)) for s, e in vecs or []] + ["  {nullptr, nullptr}"]), len(vecs or [])))
     return "\n".join(out) + "\n"
@@ -1726,6 +1741,19 @@ def bridge_entry(key: tuple, declared: set, k: int, lib_path: str, weak: bool, v
         decl = alias + ('%s %s %s%s;' % (link, ctype, base, wk) if weak else "")
         return ("GD_EP(%s, %s)" % (ref, lit) if alias else "GD_E(%s, %s)" % (base, lit)), "prototype", decl
     return "GD_U(%s)" % lit, "dynamic", ""
+
+DLSTR_RE = re.compile(rb"(?<![A-Za-z0-9_$.])([A-Za-z][A-Za-z0-9_]{3,})\x00")   # an identifier ending in NUL, not inside a longer symbol
+
+def dl_named(images: list, fns: set) -> list[str]:
+    """C functions a guest may look up with dlsym: the declared ones whose names appear in its images as NUL-terminated strings."""
+    seen = set()
+    for img in images: seen |= {m.group(1).decode() for m in DLSTR_RE.finditer(open(img["path"], "rb").read())}
+    return sorted(seen & fns)
+
+def dltyped_hpp(names: list[str]) -> str:
+    """GD_DLTYPED rows, sorted by name: each function's typed caller for a dlsym result (gbridge host_sym)."""
+    rows = ["  {%s, &gd::Inv<decltype(&::%s)>::call_rt}" % (json.dumps(n), n) for n in names] + ["  {nullptr, nullptr}"]
+    return "extern const DlTyped GD_DLTYPED[] = {\n%s\n};\nextern const int GD_NDLTYPED = %d;\n" % (",\n".join(rows), len(names))
 
 def bridge_hpp(keys: list, declared: set, lib_paths: dict, weak: set, v8idx: dict | None = None,
                protos: dict | None = None, noesc: dict | None = None, ui: frozenset = frozenset(), fns: frozenset = frozenset(),
@@ -1912,6 +1940,9 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     report += [ln for _e, _f, rep in ext_out for ln in rep]
     bridge, classes = bridge_hpp(names, declared, {lib: p for lib, (_h, p) in extra.items()}, weak, v8idx, protos, noesc, ui, frozenset(allp),
                                  {k: v for ents, _f, _r in ext_out for k, v in ents.items()})
+    dlt = [] if v8 else [n for n in dl_named(images, set(allp)) if n not in noesc and "_" + n not in {k[1] for k in names}]
+    bridge += dltyped_hpp(dlt)
+    report.append("dlsym: %d host functions typed by name (named in the guest and declared)" % len(dlt))
     link_flags += ["-Wl,-U," + n[1] for n in sorted(weak) if n[1] in classes.get("prototype", []) + classes.get("suffixed", [])]
     link_flags += HOST_LINK
     link_flags += ["-fprofile-instr-generate"] * (PGO == "generate") + ["-flto=thin", "-Wl,-cache_path_lto," + os.path.join(OBJ_CACHE, "lto")] * LTO
@@ -1970,9 +2001,10 @@ def translate(exe_path: str, out_dir: str, sdk: str, host_extra: dict | None = N
     vecs = objc_vecrecs(sdk, hdrs) if LIBOBJC in host_libs(images) else []   # every framework umbrella and extra host header
     ok = compiling_types(sdk, host_hdrs, sorted({r[4] for r in fp})) if fp else set()
     open(os.path.join(out_dir, "gdyld_gen.hpp"), "w").write(gen_hpp(*dl_rows(images), [r for r in fp if r[4] in ok], vecs))
-    report.append("objc: %d guest classes, %d categories, %d protocols, %d selector refs, %d variadic host methods, %d typed ^? "
+    report.append("objc: %d guest classes, %d categories, %d protocols, %d selector refs, %d variadic host methods, %d typed ^? and %d typed @? "
                   "parameters (%d dropped: type not spellable in host.cpp)" % (*tuple(sum(row[j][1] for row in oc) for j in range(4)), len(vmeth),
-                                                                               sum(r[4] in ok for r in fp), sum(r[4] not in ok for r in fp)))
+                                                                               sum(r[4] in ok and "(^)" not in r[4] for r in fp),
+                                                                               sum(r[4] in ok and "(^)" in r[4] for r in fp), sum(r[4] not in ok for r in fp)))
     units.append(os.path.join(out_dir, "host.cpp"))
     open(units[-1], "w").write(host_cpp(BASE_HEADERS + [h for h in usable if h not in BASE_HEADERS], bool(v8), ui_guard, [e.HEADER for e, _ks in exts]))
     exe = os.path.join(out_dir, "translated")

@@ -355,9 +355,14 @@ static bool is_blk(uint64_t p) { return p >= 4096 && !(p & 1) && !(p >> 63) && b
 static const char* blk_sig(const Lit* b) {
   return b->flags & BF_SIG ? (const char*)(uintptr_t)b->desc[b->flags & BF_COPY_DISPOSE ? 4 : 2] : nullptr;
 }
+static bool unsigned_guest_blk(uint64_t p) {                  /* a guest block native code could call, with no signature to call it by */
+  return is_blk(p) && in_guest(((const Lit*)(uintptr_t)p)->invoke) && !blk_sig((const Lit*)(uintptr_t)p);
+}
 static void* clo_get(Sig* s, uint64_t g);
 static bool x86_stret(const GT& t) { return t.k == T_REC && t.size > 16; }   /* SysV MEMORY class (packed records are refused) */
-static void hostify_blk(uint64_t p) {                         /* in place: typed invoke closure, host-callable helpers */
+/* in place: a typed invoke closure and host-callable helpers. call false: a copy only (_Block_copy) needs the helpers;
+   decl: the block type the callee's header declares, for a guest block without a signature of its own */
+static void hostify_blk(uint64_t p, bool call = true, const char* decl = nullptr) {
   if (!is_blk(p)) return;
   Lit* b = (Lit*)(uintptr_t)p;
   uint64_t inv = __atomic_load_n(&b->invoke, __ATOMIC_ACQUIRE);
@@ -367,7 +372,8 @@ static void hostify_blk(uint64_t p) {                         /* in place: typed
     if (in_guest(d[2])) __atomic_store_n(&d[2], (uint64_t)(uintptr_t)gd::to_host_fn<CopyH>(d[2]), __ATOMIC_RELEASE);
     if (in_guest(d[3])) __atomic_store_n(&d[3], (uint64_t)(uintptr_t)gd::to_host_fn<DispH>(d[3]), __ATOMIC_RELEASE);
   }
-  const char* sg = blk_sig(b);
+  const char* sg = blk_sig(b) ? blk_sig(b) : decl;
+  if (!sg && !call) return;                                   /* invoke stays guest code; native code calling it converts it then */
   if (!sg) die("a guest block without a signature reaches native code; invoke", inv);
   Sig* s = sig_of(sg);
   if (s->bad) die_name("a guest block whose signature has no AAPCS64 mapping reaches native code", s->enc);
@@ -472,7 +478,13 @@ static void fn_arg(const GT& t, void* d, Class cls, SEL sel, int i) {   /* i: en
   if (t.k != T_FNP || i < 2) return;
   memcpy(&v, d, 8);
   if (!guest_code(v)) return;
-  if (const FParam* f = fparam(cls, sel, i - 2)) { v = f->mk(v); memcpy(d, &v, 8); }
+  if (const FParam* f = fparam(cls, sel, i - 2)) if (f->mk) { v = f->mk(v); memcpy(d, &v, 8); }
+}
+static void blk_arg(const GT& t, const void* d, Class cls, SEL sel, int i, const char* what) {   /* i as fn_arg */
+  if ((t.k != T_ID && t.k != T_BLK) || !unsigned_guest_blk(*(const uint64_t*)d)) return;
+  const FParam* f = i >= 2 ? fparam(cls, sel, i - 2) : nullptr;
+  if (!f || !f->benc) die_name("a guest block without a signature is passed to (no block type in its header)", what);
+  hostify_blk(*(const uint64_t*)d, true, f->benc());
 }
 
 /* ---- guest -> host: one typed call through libffi (cls, sel: the method, when known) ---- */
@@ -487,6 +499,7 @@ static void host_call(CPU* c, void* fn, const Sig* s, const char* what, Class cl
     void* d = t.size <= 32 ? (void*)store[i] : __builtin_alloca(((size_t)t.size + 15) & ~(size_t)15);
     rd_arg(r, t, d); av[i] = d;
     fn_arg(t, d, cls, sel, i);
+    blk_arg(t, d, cls, sel, i, what);
     to_native(t, d);
   }
   alignas(16) unsigned char rbuf[64];
@@ -607,6 +620,7 @@ static void var_send(CPU* c, void* fn, const Sig* s, const VMeth* v, const char*
     if (s->a[i].size > 32) die_name("variadic host method with a large struct argument", name);
     rd_arg(r, s->a[i], store[i]); av[i] = store[i]; at[i] = s->at[i];
     fn_arg(s->a[i], store[i], cls, sel, i);
+    blk_arg(s->a[i], store[i], cls, sel, i, name);
     if (s->a[i].k != T_VAL) to_native(s->a[i], store[i]);
   }
   const uint64_t* va = (const uint64_t*)(uintptr_t)((r.sa + 7) & ~7ULL);
@@ -682,7 +696,7 @@ static void fwd_send(CPU* c, id self, SEL sel) {
     if (t.k == T_VAL) die_name("forwarded message with a va_list parameter", sel_getName(sel));
     void* d = __builtin_alloca(((size_t)t.size + 15) & ~(size_t)15);
     rd_arg(r, t, d);
-    if (i >= 2) { fn_arg(t, d, rc, sel, i); to_native(t, d); ((void (*)(id, SEL, void*, long))objc_msgSend)(inv, setarg, d, i); }
+    if (i >= 2) { fn_arg(t, d, rc, sel, i); blk_arg(t, d, rc, sel, i, sel_getName(sel)); to_native(t, d); ((void (*)(id, SEL, void*, long))objc_msgSend)(inv, setarg, d, i); }
   }
   ((void (*)(id, SEL, id))objc_msgSend)(self, sel_registerName("forwardInvocation:"), inv);
   if (s->ret.k == T_VOID) return;
@@ -831,9 +845,21 @@ static void m_fill(MIc* ic, Class cls, SEL sel, IMP imp, unsigned long ep, int k
   pthread_mutex_unlock(&mu);
   if (e->kind) __atomic_store_n(&ic->e, e, __ATOMIC_RELEASE);
 }
+static int m_gpr_arg(const Sig* s, int slot) {                /* the encoding index of general-register argument `slot` (as m_typed counts them) */
+  for (int i = 0, k = 0; i < s->n; i++) {
+    const GT& t = s->a[i];
+    if ((t.k == T_INT || t.k == T_ID || t.k == T_BLK || (t.k == T_PTR && !t.nco)) && k++ == slot) return i;
+  }
+  return -1;
+}
 static void m_host(CPU* c, const MEnt* e) {                   /* the typed direct call (host_call's effect for these encodings) */
   uint64_t a[MS_GPR] = {0, 0, 0, 0, 0, 0};
-  for (int i = 0; i < e->ngp; i++) { a[i] = m_ext(c->X[i], e->ext[i]); if (e->blk[i]) hostify_blk(a[i]); }
+  for (int i = 0; i < e->ngp; i++) {
+    a[i] = m_ext(c->X[i], e->ext[i]);
+    if (!e->blk[i]) continue;
+    if (unsigned_guest_blk(a[i])) { int j = m_gpr_arg(e->s, i); blk_arg(e->s->a[j], &a[i], e->cls, e->sel, j, sel_getName(e->sel)); }
+    hostify_blk(a[i]);
+  }
   void* fn = (void*)e->imp;
   uint64_t r = 0; MX v = {0, 0};
   if (!e->nfp) {
@@ -1242,7 +1268,7 @@ static void nslogv(uint64_t fmt, const uint64_t* va) {        /* NSLog with the 
 }
 }  // namespace go
 
-static void gobjc_hostify(uint64_t blk) { go::hostify_blk(blk); }
+static void gobjc_hostify(uint64_t blk, const char* decl) { go::hostify_blk(blk, true, decl); }
 static bool gobjc_guest_block(uint64_t b) {                   /* any value: read only when mapped */
   return go::readable(b, 8) && go::is_blk(b) && go::readable(b + 16, 8) && in_guest(((const go::Lit*)(uintptr_t)b)->invoke);
 }
@@ -1287,8 +1313,8 @@ static void sp_imp_implementationWithBlock(CPU* c, int) {
 static void sp_objc_msgSend(CPU* c, int) { go::send(c, 0); }
 static void sp_objc_msgSendSuper(CPU* c, int) { go::send(c, 1); }
 static void sp_objc_msgSendSuper2(CPU* c, int) { go::send(c, 2); }
-static void sp_objc_retainBlock(CPU* c, int) { go::hostify_blk(c->X[0]); c->X[0] = (uint64_t)(uintptr_t)objc_retainBlock((id)(uintptr_t)c->X[0]); }
-static void sp_Block_copy(CPU* c, int) { go::hostify_blk(c->X[0]); c->X[0] = (uint64_t)(uintptr_t)_Block_copy((const void*)(uintptr_t)c->X[0]); }
+static void sp_objc_retainBlock(CPU* c, int) { go::hostify_blk(c->X[0], false); c->X[0] = (uint64_t)(uintptr_t)objc_retainBlock((id)(uintptr_t)c->X[0]); }
+static void sp_Block_copy(CPU* c, int) { go::hostify_blk(c->X[0], false); c->X[0] = (uint64_t)(uintptr_t)_Block_copy((const void*)(uintptr_t)c->X[0]); }
 static void sp_Block_object_assign(CPU* c, int) {             /* the guest copy helper copying a captured block / __block var */
   int fl = (int)c->X[2];
   if (fl & go::FIELD_BYREF) go::hostify_byref(c->X[1]);
