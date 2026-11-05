@@ -19,3 +19,4 @@ tools/beds_local.txt
 tools/protected_ranges.txt
 sbt/swift_sigs.json
 guestrt/src/
+examples/*/work/

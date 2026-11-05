@@ -1,4 +1,4 @@
-"""Scalar (non-vector) AArch64 families for the recompiler: scalar FP, conditional compare, atomics/ordering,
+"""Scalar (non-vector) AArch64 families for the recompiler: scalar FP, conditional compare, atomics/ordering/exclusives,
 and misc integer ops. recompile.lift() routes here when the instruction has no vector operand and its base
 mnemonic is in MNEMONICS. Library; proven by sbt/microtest.py cases_scalar."""
 ###############
@@ -9,15 +9,18 @@ import re, struct
 from capstone.arm64 import ARM64_OP_REG, ARM64_OP_IMM, ARM64_OP_FP
 from cgen import CC, reg_parts, rd, wr, mem_addr
 
-LSE_OPS = ("ldadd", "ldclr", "ldset", "ldeor", "swp", "cas", "stadd", "stclr", "stset", "steor")
+LSE_OPS = ("ldadd", "ldclr", "ldset", "ldeor", "ldsmax", "ldsmin", "ldumax", "ldumin", "swp", "cas",
+           "stadd", "stclr", "stset", "steor", "stsmax", "stsmin", "stumax", "stumin")
 ORDERS = ("", "a", "l", "al")
 SIZES = ("", "b", "h")
 LSE_RE = re.compile(r"^(%s)(al|a|l)?(b|h)?$" % "|".join(LSE_OPS))
 ORD_RE = re.compile(r"^(ldar|ldapr|stlr|ldapur|stlur)(b|h)?$")
 RMW_ORDER = {"": "__ATOMIC_RELAXED", "a": "__ATOMIC_ACQUIRE", "l": "__ATOMIC_RELEASE", "al": "__ATOMIC_SEQ_CST"}
 CAS_FAIL = {"": "__ATOMIC_RELAXED", "a": "__ATOMIC_ACQUIRE", "l": "__ATOMIC_RELAXED", "al": "__ATOMIC_SEQ_CST"}
+# max/min: the pointer type gives the signedness
 RMW_FN = {"ldadd": "__atomic_fetch_add", "ldclr": "__atomic_fetch_and", "ldset": "__atomic_fetch_or",
-          "ldeor": "__atomic_fetch_xor", "swp": "__atomic_exchange_n"}
+          "ldeor": "__atomic_fetch_xor", "swp": "__atomic_exchange_n", "ldsmax": "__atomic_fetch_max",
+          "ldsmin": "__atomic_fetch_min", "ldumax": "__atomic_fetch_max", "ldumin": "__atomic_fetch_min"}
 LSE_CLAIM = {op + o + s for op in LSE_OPS for o in ORDERS for s in SIZES
              if not (op.startswith("st") and o in ("a", "al"))}         # st* aliases exist only plain and l
 FP_UNARY = {"fabs", "fneg", "fsqrt", "frinta", "frintm", "frintp", "fcvt"}
@@ -27,13 +30,19 @@ FP_TOINT = {"fcvtas": (0, 0), "fcvtau": (0, 1), "fcvtns": (4, 0), "fcvtnu": (4, 
             "fcvtzs": (3, 0), "fcvtzu": (3, 1)}                         # (rounding: 0 ties-away, 1 floor, 2 ceil, 3 trunc, 4 ties-even; unsigned)
 FRINT_MODE = {"frinta": 0, "frintm": 1, "frintp": 2}
 CASP_RE = re.compile(r"^casp(al|a|l)?$")
+EXCL_RE = re.compile(r"^(ld|st)(a|l)?x(r|p)(b|h)?$")                    # ld(a)xr{,b,h}, ld(a)xp, st(l)xr{,b,h}, st(l)xp
+EXCL = {"ld" + o + "x" + f + z for o in ("", "a") for f, zs in (("r", SIZES), ("p", ("",))) for z in zs} \
+     | {"st" + o + "x" + f + z for o in ("", "l") for f, zs in (("r", SIZES), ("p", ("",))) for z in zs} | {"clrex"}
+UINT = {8: "uint8_t", 16: "uint16_t", 32: "uint32_t", 64: "uint64_t", 128: "unsigned __int128"}
 CRC = {"crc32" + s: (0xEDB88320, n) for s, n in (("b", 1), ("h", 2), ("w", 4), ("x", 8))}
 CRC.update({"crc32c" + s: (0x82F63B78, n) for s, n in (("b", 1), ("h", 2), ("w", 4), ("x", 8))})   # reflected polynomials
 MNEMONICS: set = ({"brk", "ccmp", "ccmn", "ngc", "ngcs", "smnegl", "umnegl", "fmov", "fcsel", "fccmp", "fccmpe", "mrs", "msr"}
                   | FP_UNARY | FP_BINARY | set(FP_FMA) | set(FP_TOINT) | LSE_CLAIM | set(CRC)
-                  | {"casp" + o for o in ORDERS} | {b + s for b in ("ldar", "ldapr", "stlr", "ldapur", "stlur") for s in SIZES})
+                  | {"casp" + o for o in ORDERS} | {b + s for b in ("ldar", "ldapr", "stlr", "ldapur", "stlur") for s in SIZES} | EXCL)
 SIGN = {32: "0x80000000u", 64: "0x8000000000000000ULL"}
 C_HELPERS = r"""
+static __thread uint64_t s_xa __attribute__((unused)) = ~0ULL;   /* exclusive monitor: address and value of the last exclusive load */
+static __thread unsigned __int128 s_xv __attribute__((unused));
 #define S_GEN(N,T,F,SG,EXPM,QB,FMA,SQRT,RND,FLR,CEIL) \
 static inline F s_tf##N(T u){F f;memcpy(&f,&u,sizeof f);return f;} \
 static inline T s_fu##N(F f){T u;memcpy(&u,&f,sizeof u);return u;} \
@@ -163,7 +172,7 @@ def lift_mnegl(ins: object, m: str, ops: list) -> str:
 # atomics and ordering
 ###############
 def lift_lse(ins: object, m: str, ops: list) -> str:
-    """LSE ld<op>/st<op>/swp/cas in every order and width as host __atomic builtins on the guest address."""
+    """LSE ld<op>/st<op>/swp/cas (signed and unsigned max/min too) in every order and width as host __atomic builtins on the guest address."""
     op, order, size = LSE_RE.match(m).groups()
     order = order or ""
     w = {"b": 8, "h": 16}.get(size, ireg(ins, ops[0])[2])
@@ -177,8 +186,9 @@ def lift_lse(ins: object, m: str, ops: list) -> str:
         return ("{ %s _e=%s; __atomic_compare_exchange_n((%s*)(%s), &_e, (%s)(%s), 0, %s, %s); %s }"
                 % (ct, rs, ct, addr, ct, rd(tk, ti, rw), RMW_ORDER[order], CAS_FAIL[order], wr(sk, si, rw, "_e")))
     base = "ld" + op[2:] if op.startswith("st") else op
-    val = "(%s)~%s" % (ct, rs) if base == "ldclr" else rs
-    call = "%s((%s*)(%s), %s, %s)" % (RMW_FN[base], ct, addr, val, RMW_ORDER[order])
+    at = "int%d_t" % w if base in ("ldsmax", "ldsmin") else ct
+    val = "(%s)~%s" % (ct, rs) if base == "ldclr" else "(%s)%s" % (at, rs)
+    call = "(%s)%s((%s*)(%s), %s, %s)" % (ct, RMW_FN[base], at, addr, val, RMW_ORDER[order])
     if op.startswith("st"): return "(void)%s;" % call
     tk, ti, _ = ireg(ins, ops[1])
     return "{ %s _o=%s; %s }" % (ct, call, wr(tk, ti, rw, "_o"))
@@ -193,6 +203,26 @@ def lift_casp(ins: object, m: str, ops: list) -> str:
     return ("{ %s _e=%s, _n=%s; __atomic_compare_exchange_n((%s*)(%s), &_e, _n, 0, %s, %s); %s %s }"
             % (ct, pair(sk, si, s2k, s2i), pair(tk, ti, t2k, t2i), ct, addr, RMW_ORDER[order], CAS_FAIL[order],
                wr(sk, si, w, "(uint64_t)_e"), wr(s2k, s2i, w, "(uint64_t)(_e>>%d)" % sh)))
+
+def lift_excl(ins: object, m: str, ops: list) -> str:
+    """Exclusives as QEMU models them: a load-exclusive (ld(a)xr*, ld(a)xp) records its address and value, the matching
+    store-exclusive (st(l)xr*, st(l)xp) is a compare-exchange against that value at that address, status 0 when it held, 1
+    otherwise (the guest's loop retries); clrex and every store-exclusive clear the monitor; acquire / release forms seq_cst."""
+    if m == "clrex": return "s_xa=~0ULL;"
+    kind, order, _form, size = EXCL_RE.match(m).groups()
+    regs = [ireg(ins, o) for o in ops[:-1]]
+    data = regs if kind == "ld" else regs[1:]
+    w = {"b": 8, "h": 16}.get(size, data[0][2])
+    ct, rw, mask = UINT[w * len(data)], 64 if w == 64 else 32, "0x%xULL" % ((1 << w) - 1)
+    mo = "__ATOMIC_SEQ_CST" if order else "__ATOMIC_RELAXED"
+    head = "{ uint64_t _a=%s;" % mem_addr(ins, ops[-1], None)[0]
+    if kind == "ld":
+        outs = [wr(k, i, rw, "(uint64_t)(_v>>%d)&%s" % (w * j, mask)) for j, (k, i, _w) in enumerate(data)]
+        return "%s %s _v=__atomic_load_n((%s*)_a, %s); s_xa=_a; s_xv=(unsigned __int128)_v; %s }" % (head, ct, ct, mo, " ".join(outs))
+    new = "|".join("((%s)(%s(%s)&%s)<<%d)" % (ct, "(uint64_t)", rd(k, i, rw), mask, w * j) for j, (k, i, _w) in enumerate(data))
+    sk, si, _ = regs[0]
+    return ("%s %s _e=(%s)s_xv, _n=%s; int _f=s_xa!=_a || !__atomic_compare_exchange_n((%s*)_a, &_e, _n, 0, %s, __ATOMIC_RELAXED); s_xa=~0ULL; %s }"
+            % (head, ct, ct, new, ct, mo, wr(sk, si, 32, "(uint64_t)_f")))
 
 def lift_crc(ins: object, m: str, ops: list) -> str:
     """crc32{b,h,w,x} / crc32c{b,h,w,x}: reflected CRC update of Wn by the low bytes of Rm, no pre/post inversion."""
@@ -314,6 +344,7 @@ def lift_scalar(ins: object, m: str, ops: list) -> str:
     if m in ("smnegl", "umnegl"): return lift_mnegl(ins, m, ops)
     if ORD_RE.match(m): return lift_ordered(ins, m, ops)
     if CASP_RE.match(m): return lift_casp(ins, m, ops)
+    if m in EXCL: return lift_excl(ins, m, ops)
     if m in CRC: return lift_crc(ins, m, ops)
     if m in ("mrs", "msr"): return lift_sysreg(ins, m, ops)
     if LSE_RE.match(m): return lift_lse(ins, m, ops)

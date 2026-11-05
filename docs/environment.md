@@ -39,7 +39,7 @@ Each one is off when unset.
 
 | Variable | Value | Effect |
 |---|---|---|
-| `GDYLD_CRASH_TRACE` | any | On `SIGSEGV` or `SIGBUS`, prints `FATAL: signal ...` with the faulting address and registers and a host backtrace, then exits with status 71. |
+| `GDYLD_CRASH_TRACE` | any | On `SIGSEGV` or `SIGBUS`, prints `FATAL: signal ...` with the faulting address and registers and a host backtrace, then exits with status 71. A loud stop (status 70) prints its host backtrace after the `FATAL:` line too. |
 | `GDYLD_TRACE_IMPORTS` | any | Counts the calls to every host import and prints `import-trace <name> <calls> first <order>` lines at exit and before a loud stop; when the initializers finish it prints the same counts as `import-trace-init` lines. |
 | `GDYLD_STOP_AT_IMPORT` | `name[,name...]` | Stops loudly before the host call when the guest calls one of the named imports, with or without the leading underscore, by any route. |
 | `GDYLD_HEAP_GUARD` | `lo-hi` or `lo-hi,host` | Gives each guest `malloc`, `calloc`, `aligned_alloc` and default-zone `malloc_zone_malloc` block of `lo` to `hi` bytes (`hi` at most 3072) its own page, followed by an inaccessible page. |

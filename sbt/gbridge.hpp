@@ -41,15 +41,19 @@ struct objc_object; using gd_id = objc_object*;               /* a plain C++ emb
 extern "C" void dispatch(CPU* c, uint64_t a);
 extern "C" int __cxa_atexit(void (*)(void *), void *, void *);
 static void (*gd_die_hook)();                                 /* GDYLD_TRACE_IMPORTS: lists the imports called before a loud stop */
-[[noreturn]] static void die(const char* what, uint64_t a) {
-  fprintf(stderr, "FATAL: %s 0x%llx\n", what, (unsigned long long)a); fflush(stderr);
+static bool gd_stop_trace;                                    /* GDYLD_CRASH_TRACE: a loud stop prints the host backtrace too */
+[[noreturn]] static void stop70() {
+  if (gd_stop_trace) { void* f[64]; fprintf(stderr, "host backtrace:\n"); fflush(stderr); backtrace_symbols_fd(f, backtrace(f, 64), 2); }
   if (gd_die_hook) gd_die_hook();
   _exit(70);
 }
+[[noreturn]] static void die(const char* what, uint64_t a) {
+  fprintf(stderr, "FATAL: %s 0x%llx\n", what, (unsigned long long)a); fflush(stderr);
+  stop70();
+}
 [[noreturn]] static void die_name(const char* what, const char* name) {
   fprintf(stderr, "FATAL: %s: %s\n", what, name); fflush(stderr);
-  if (gd_die_hook) gd_die_hook();
-  _exit(70);
+  stop70();
 }
 extern "C" void gd_die(const char* what, uint64_t a) { die(what, a); }
 extern "C" void unsupported(CPU* c, uint64_t a) { (void)c; die("unsupported instruction at", a); }
@@ -67,6 +71,9 @@ struct HBind { uint64_t addr; int k; int64_t addend; int weak; };
 struct TlvImg { uint64_t start, init, size, align; };
 struct GExp { int img; const char* name; uint64_t addr; };    /* guest export, C name (no leading underscore) */
 extern const Ent ENT[]; extern const int NIMP;
+/* bridge.hpp GD_DLTYPED: a dlsym result's typed caller, by name */
+struct DlTyped { const char* name; void (*call)(CPU*, void*); };
+extern const DlTyped GD_DLTYPED[]; extern const int GD_NDLTYPED;
 extern const Img IMG[]; extern const int NIMG;
 extern const HBind HB[]; extern const int NHB;
 extern const uint64_t INITS[]; extern const int NINIT;
@@ -181,7 +188,9 @@ static const char* ui_code(const void* p) {                   /* the UI framewor
 }
 
 /* ---- address classes the guest can hold as a function pointer ---- */
-struct Hnd { void* fn; void (*call)(CPU*, void*); const char* ui; };   /* ui: a UI framework's code: never called, never handed on */
+/* ui: a UI framework's code: never called, never handed on; decl: call is the function's own declared type, every pointer to it
+   reuses this handle */
+struct Hnd { void* fn; void (*call)(CPU*, void*); const char* ui; bool decl; };
 static Hnd HND[GD_MAX_HANDLES]; static int nhnd;              /* handle i lives at GD_HANDLE_BASE + i*GD_HANDLE_SLOT */
 static pthread_mutex_t reg_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -287,7 +296,22 @@ static int handle_index(uint64_t a) {                         /* handle index or
          ? (int)i : -1;
 }
 static bool guest_code(uint64_t a) { return guest_fn_start(a) || import_slot(a) >= 0 || handle_index(a) >= 0; }
-static void gobjc_hostify(uint64_t blk);                      /* gobjc.hpp: a guest block made callable by native code */
+/* gobjc.hpp: a guest block made callable by native code; decl: the signature of its declared block type, for a block
+   without one of its own */
+static void gobjc_hostify(uint64_t blk, const char* decl = nullptr);
+#if __OBJC__
+template <class T> struct gd_benc;                            /* a block type's signature: @encode of its result, the block, each parameter */
+template <class R, class... A> struct gd_benc<R (^)(A...)> {
+  static const char* get() {
+    static const char* s = [] {
+      size_t n = strlen(@encode(R)) + 3; ((n += strlen(@encode(A))), ...);
+      char* b = (char*)calloc(1, n); strcpy(b, @encode(R)); strcat(b, "@?"); (strcat(b, @encode(A)), ...);
+      return (const char*)b;
+    }();
+    return s;
+  }
+};
+#endif
 static bool gobjc_guest_block(uint64_t b);                    /* gobjc.hpp: b is a block whose invoke is guest code */
 static uint64_t gobjc_target(uint64_t code);                  /* gobjc.hpp: libffi closure -> its guest code, else 0 */
 [[noreturn]] static void gobjc_boundary_throw();              /* gobjc.hpp: a sentinel-claimed exception leaves as a host one */
@@ -307,25 +331,30 @@ static void guest_returned(CPU* c) {
   if (c->unw && c->unw != GD_SENTINEL) die("guest returned to an address that is no pending call site on this thread", c->unw);
   c->unw = 0;
 }
-static uint64_t handle_of(void* fn, void (*call)(CPU*, void*)) {   /* call == nullptr: untyped (refuses to be called) */
+/* call == nullptr: untyped (refuses to be called); decl: call comes from fn's own declaration (one handle per fn from then on) */
+static uint64_t handle_of(void* fn, void (*call)(CPU*, void*), bool decl = false) {
   pthread_mutex_lock(&reg_mu);
   int n = nhnd, i = 0;
-  while (i < n && !(HND[i].fn == fn && (!call || !HND[i].call || HND[i].call == call))) i++;
+  while (i < n && !(HND[i].fn == fn && (!call || !HND[i].call || HND[i].call == call || HND[i].decl || decl))) i++;
   if (i == n) {
     if (n == GD_MAX_HANDLES) die("host function handle table full", (uint64_t)(uintptr_t)fn);
-    HND[n].fn = fn; HND[n].ui = ui_code(fn);
+    HND[n].fn = fn; HND[n].ui = ui_code(fn); HND[n].decl = decl && call;
     __atomic_store_n(&HND[n].call, call, __ATOMIC_RELEASE); __atomic_store_n(&nhnd, n + 1, __ATOMIC_RELEASE);
-  } else if (call && !HND[i].call) __atomic_store_n(&HND[i].call, call, __ATOMIC_RELEASE);   /* typed after an untyped dlsym */
+  } else if (call && (!HND[i].call || (decl && !HND[i].decl))) {   /* typed after an untyped dlsym, or by its declaration */
+    HND[i].decl = decl;
+    __atomic_store_n(&HND[i].call, call, __ATOMIC_RELEASE);
+  }
   pthread_mutex_unlock(&reg_mu);
   return GD_HANDLE_BASE + (uint64_t)i * GD_HANDLE_SLOT;
 }
-static uint64_t code_to_guest(uint64_t v, void (*call)(CPU*, void*)) {   /* host code address -> guest-held value */
+/* host code address -> guest-held value (decl as handle_of) */
+static uint64_t code_to_guest(uint64_t v, void (*call)(CPU*, void*), bool decl = false) {
   if (v < 4096 || v > ~4095ULL) return v;                     /* NULL, SIG_DFL/SIG_IGN/SIG_HOLD/SIG_ERR sentinels */
   if (uint64_t g = rev_find(v)) return g;                     /* one of our closures: the original guest address */
   if (uint64_t g = gobjc_target(v)) return g;                 /* a typed ObjC method or block closure */
   for (int k = 0; k < NIMP; k++)                              /* an import: the guest's own pointer to it */
     if (ENT[k].hostfn && (uint64_t)(uintptr_t)ENT[k].hostfn == v) return GD_IMPORT_BASE + (uint64_t)k * GD_IMP_SLOT;
-  return handle_of((void*)(uintptr_t)v, call);
+  return handle_of((void*)(uintptr_t)v, call, decl);
 }
 /* 1 if p lies in an instruction section of a loaded image. By section, not segment: an executable __TEXT segment also
    holds data (__const, __cstring, Swift descriptors such as protocol requirements bases '...TL'). */
@@ -828,7 +857,11 @@ template<class T> T get(Rd& r) {
     } else if constexpr (k == KFNPTR) {
       v = to_host_fn<T>(rd_x(r));
     } else if constexpr (k == KBLK) {
+#if __OBJC__
+      uint64_t b = rd_x(r); gobjc_hostify(b, gd_benc<T>::get()); memcpy((void*)&v, &b, 8);
+#else
       uint64_t b = rd_x(r); gobjc_hostify(b); memcpy((void*)&v, &b, 8);
+#endif
     } else if constexpr (k == KEMPTY) {
     } else die("import parameter type has no AAPCS64 mapping (long vector, va_list, int128, complex)", sizeof(T));
     return v;
@@ -1385,11 +1418,12 @@ template<class G, class R, class C, class H, R (*F)(C, H*)> struct AbiNarrowOne<
    GD_DLI: per guest image its install name, its LC_RPATHs as written ('\n'-separated), what dlsym searches through its
    handle (dyld's order: itself, then its dependencies depth first; `first` for RTLD_FIRST: itself and what it re-exports;
    k >= 0 a guest image, k < 0 the host library GD_DLHOST[-1 - k]) and its guest dependencies in order (an upward link as
-   ~k) for running initializers on dlopen; GD_FPARAM: ObjC methods (sorted by selector) with a function-pointer parameter
-   `arg` (0 = the first after _cmd), mk turning guest code into a closure of the header's type; GD_VECREC: ObjC methods
-   (sorted by selector, encoding as gobjc enc_key) whose header type has a record holding a SIMD vector */
+   ~k) for running initializers on dlopen; GD_FPARAM: ObjC methods (sorted by selector) with a function-pointer or block
+   parameter `arg` (0 = the first after _cmd): mk turns guest code into a closure of the header's function type, benc gives
+   the header's block type as a block signature; GD_VECREC: ObjC methods (sorted by selector, encoding as gobjc enc_key)
+   whose header type has a record holding a SIMD vector */
 struct DlImg { const char* id; const char* rpaths; const int* deps; int ndeps; const int* first; int nfirst; const int* idep; int nidep; };
-struct FParam { const char* cls; const char* sel; int cmeth, arg; uint64_t (*mk)(uint64_t); };
+struct FParam { const char* cls; const char* sel; int cmeth, arg; uint64_t (*mk)(uint64_t); const char* (*benc)(); };
 struct VecRec { const char* sel; const char* key; };
 #if __has_include("gdyld_gen.hpp")
 #include "gdyld_gen.hpp"
@@ -1397,7 +1431,7 @@ struct VecRec { const char* sel; const char* key; };
 #ifndef GD_HAVE_GEN
 static const DlImg GD_DLI[] = {{nullptr, "", nullptr, 0, nullptr, 0, nullptr, 0}}; static const int GD_NDLI = 0;
 static const char* const GD_DLHOST[] = {nullptr}; static const int GD_NDLHOST = 0;
-static const FParam GD_FPARAM[] = {{nullptr, nullptr, 0, 0, nullptr}}; static const int GD_NFPARAM = 0;
+static const FParam GD_FPARAM[] = {{nullptr, nullptr, 0, 0, nullptr, nullptr}}; static const int GD_NFPARAM = 0;
 static const VecRec GD_VECREC[] = {{nullptr, nullptr}}; static const int GD_NVECREC = 0;
 #endif
 #include "gobjc.hpp"
@@ -1777,8 +1811,16 @@ static void sp_dlerror(CPU* c, int) {
   if (dl_msg_set) { dl_msg_set = false; c->X[0] = (uint64_t)(uintptr_t)dl_msg; return; }
   c->X[0] = (uint64_t)(uintptr_t)dlerror();
 }
-static uint64_t host_sym(void* p, const char* nm) {           /* host code -> import slot, typed handle (GD_TYPED) or untyped handle */
-  return p && host_code(p) ? code_to_guest((uint64_t)(uintptr_t)p, GD_TYPED(nm, p)) : (uint64_t)(uintptr_t)p;
+static void (*dl_typed(const char* nm))(CPU*, void*) {        /* GD_DLTYPED's caller for nm (sorted by name), else nullptr */
+  int lo = 0, hi = GD_NDLTYPED;
+  while (lo < hi) { int m = (lo + hi) / 2, d = strcmp(GD_DLTYPED[m].name, nm); if (!d) return GD_DLTYPED[m].call; if (d < 0) lo = m + 1; else hi = m; }
+  return nullptr;
+}
+static uint64_t host_sym(void* p, const char* nm) {           /* host code -> import slot, typed handle (GD_TYPED, GD_DLTYPED) or untyped handle */
+  if (!p || !host_code(p)) return (uint64_t)(uintptr_t)p;
+  void (*call)(CPU*, void*) = GD_TYPED(nm, p);
+  if (!call) call = dl_typed(nm);
+  return code_to_guest((uint64_t)(uintptr_t)p, call, call != nullptr);
 }
 static void* dl_host(int j, bool first) {                     /* host library j of GD_DLHOST, loaded with the program */
   return dlopen(GD_DLHOST[j], RTLD_LAZY | RTLD_NOLOAD | (first ? RTLD_FIRST : 0));   /* ponytail: one dlopen per lookup */
@@ -1869,6 +1911,25 @@ static void sp_sigaction(CPU* c, int) {                       /* the handler sit
     *go = ho; go->__sigaction_u.__sa_handler = reinterpret_cast<SigH>((uintptr_t)g);
   }
   RET(r);
+}
+
+/* AudioUnitSetProperty: kAudioUnitProperty_SetRenderCallback (23) and kAudioOutputUnitProperty_SetInputCallback (2005)
+   pass an AURenderCallbackStruct {inputProc, inputProcRefCon} through the untyped data buffer, so CoreAudio would call
+   the guest's inputProc natively; it is bridged on a host copy as AURenderCallback (unit, flags, time stamp, bus, frame
+   count, buffer list). Found with dlsym: no AudioToolbox header in every translation */
+using GdAURender = int32_t (*)(void*, uint32_t*, const void*, uint32_t, uint32_t, void*);
+static void sp_AudioUnitSetProperty(CPU* c, int) {
+  using F = int32_t (*)(void*, uint32_t, uint32_t, uint32_t, const void*, uint32_t);
+  static F real = (F)dlsym(RTLD_DEFAULT, "AudioUnitSetProperty");
+  uint32_t id = (uint32_t)c->X[1], size = (uint32_t)c->X[5];
+  const void* data = (const void*)(uintptr_t)c->X[4];
+  uint64_t cb[2];
+  if ((id == 23 || id == 2005) && data && size >= sizeof cb) {
+    memcpy(cb, data, sizeof cb);
+    if (guest_code(cb[0])) cb[0] = (uint64_t)(uintptr_t)gd::to_host_fn<GdAURender>(cb[0]);
+    data = cb;
+  }
+  RET(real((void*)(uintptr_t)c->X[0], id, (uint32_t)c->X[2], (uint32_t)c->X[3], data, size));
 }
 
 struct Tramp { uint64_t fn, arg; size_t gsz; };
@@ -2524,6 +2585,7 @@ int main(int argc, char** argv, char** envp) {
   size_t pg = (size_t)getpagesize();
   if (!GD_UI_GUARD) { fprintf(stderr, "gdyld: UI guard OFF (built with ui_guard=False): window, AppKit and GPU calls run\n"); fflush(stderr); }
   if (getenv("GDYLD_CRASH_TRACE")) {
+    gd_stop_trace = true;
     struct sigaction sa; memset(&sa, 0, sizeof sa); sa.sa_sigaction = crash_trace; sa.sa_flags = SA_SIGINFO;
     sigaction(SIGSEGV, &sa, nullptr); sigaction(SIGBUS, &sa, nullptr);
   }

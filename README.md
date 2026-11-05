@@ -12,49 +12,52 @@ Rosetta 2 lets a Mac with Apple silicon run Intel apps. It does not run the othe
 Hand an Intel Mac a program built only for arm64 and it answers `Bad CPU type in executable`, and that is the end of it.
 
 Recask is a static binary translator that turns that program into a native x86-64 executable.
-It lifts the program, and the arm64 dylibs it links, to C, compiles that C for x86-64, and links one executable that calls the Intel Mac's own system libraries.
+It lifts the program and its arm64 dylibs to C, compiles that C for x86-64, and links one executable that calls the Intel Mac's own system libraries.
 No emulator rides along: by the time the program starts, its arm64 code is gone.
-In the code and these docs, the translated arm64 program is the guest and the Intel Mac's native side is the host.
+In the code and these docs, the translated program is the guest and the Intel Mac's native side is the host.
 
-<p align="center"><img alt="On an Intel iMac: an arm64-only sqlite3 is refused with Bad CPU type, translated, then runs a Mandelbrot query" src="docs/demo/sqlite.gif" width="760"></p>
+<p align="center"><img alt="Hex's first-run screen, translated, on an Intel iMac" src="docs/demo/hex.png" width="700"></p>
+<p align="center"><sub>Hex 3.3.0, an Apple-silicon-only release, translated on an Intel iMac (<a href="#what-it-runs">the run</a>).</sub></p>
 
 ## Features
 
-- **Native code, not emulation** — each arm64 function becomes a C function over a CPU-state struct, and the output executes no arm64 code.
-- **Byte-identical on real software** — the translated SQLite shell matches a native x86-64 build byte for byte, and reproduces SQLite's own speedtest1 hash ([the run](#example-sqlite-on-an-intel-mac)).
-- **Software that ships only for Apple silicon** — LLVM's official clang 23 builds SQLite on an Intel iMac, and Apple's MLX trains a network there, matching Apple silicon ([the runs](#example-software-that-ships-only-for-apple-silicon)).
-- **Measured speed** — SQLite's suite takes 1.5 times as long as a native build; the translated clang takes 3.3 times as long as Apple's native clang to compile SQLite.
-- **The whole load graph** — the program and the arm64 dylibs it links become one `translated` executable; a dependency with an x86-64 slice is used natively.
-- **Typed calls into macOS** — C functions the SDK headers declare are bridged to the x86-64 calling convention with their prototypes' types; `printf` and `objc_msgSend` get hand-written bridges.
-- **Objective-C, blocks, Swift and C++** — guest classes register with the host Objective-C runtime, Swift imports are bridged with swiftc's own signatures, and C++ exceptions unwind.
-- **Loud stops** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line and exit status 70; the known gaps that change output instead are in [docs/limits.md](docs/limits.md).
-- **Tested against native** — most of its 26 test beds compare a translated arm64 build with a native x86-64 build of the same program, and a bed exits 1 on any mismatch; single instructions are checked against the Unicorn emulator.
+- **Native code, not emulation** — each arm64 function becomes a C function; the output runs no arm64 code.
+- **Apps, not only commands** — with `--ui-guard-off`, AppKit, Metal and CoreAudio calls reach the Intel Mac's own frameworks.
+- **Byte-identical on real software** — translated SQLite matches a native build byte for byte; LLVM's arm64-only clang 23 writes the same objects as on Apple silicon.
+- **Measured speed** — SQLite's suite runs in 1.5 times the native time; translated clang compiles SQLite in 3.3 times Apple's native clang's time.
+- **The whole load graph** — the program and its arm64 dylibs, C++ runtime included, become one `translated` executable; dependencies with an x86-64 slice run natively.
+- **Typed calls into macOS** — C functions the SDK declares are bridged with their prototypes' types; `printf` and `objc_msgSend` have hand-written bridges.
+- **Objective-C, blocks, Swift and C++** — guest classes join the host runtime, guest blocks become host blocks, Swift imports use swiftc's signatures, C++ exceptions unwind.
+- **Loud stops** — what it cannot translate stops with a `FATAL:` line and exit status 70; the gaps that change output instead are in [docs/limits.md](docs/limits.md).
+- **Tested against native** — most of its 26 test beds compare translated arm64 builds with native x86-64 ones and fail on any mismatch; the Unicorn emulator checks single instructions.
 
 ## Install
 
 You need:
 
-- **An Intel Mac.** The lifted code is compiled with `-mavx2 -mfma -mbmi -mbmi2 -mlzcnt -mpopcnt -mf16c -maes -mpclmul`, so its CPU must have those extensions: in practice Intel's Haswell generation (2013) or newer.
-  `sysctl machdep.cpu.features machdep.cpu.leaf7_features machdep.cpu.extfeatures` lists them (look for AVX2, BMI1, BMI2, FMA, F16C, AES, PCLMULQDQ, POPCNT and LZCNT).
+- **An Intel Mac** from Intel's Haswell generation (2013) or newer: the lifted code is compiled with AVX2, FMA, BMI1, BMI2, F16C, AES, PCLMULQDQ, POPCNT and LZCNT.
 - **Xcode Command Line Tools.** The translator runs `/usr/bin/clang` and `/usr/bin/clang++`, and through `xcrun` it runs `swiftc` and `swift-demangle` and finds the SDK.
 - **Python 3.9 or newer**, with the packages in `requirements.txt` (capstone, libclang and unicorn).
 - **CMake**, only for building the guest C++ runtime and for the MLX example.
 
-Create the Python environment at the repository root, where the scripts' usage lines expect `sbtenv/bin/python`:
+Create the Python environment at the repository root, where the scripts' usage lines expect `sbtenv/bin/python`, and build the guest C++ runtime, which a C++ or Objective-C program and the tests need:
 
 ```sh
 /usr/bin/python3 -m venv sbtenv
 sbtenv/bin/pip install -r requirements.txt
-```
-
-Build the guest C++ runtime before you translate a C++ or Objective-C program, and before you run the tests:
-
-```sh
 guestrt/build.sh
 ```
 
+<details>
+<summary>The CPU check and what <code>guestrt/build.sh</code> does</summary>
+
+The exact compiler flags are `-mavx2 -mfma -mbmi -mbmi2 -mlzcnt -mpopcnt -mf16c -maes -mpclmul`.
+`sysctl machdep.cpu.features machdep.cpu.leaf7_features machdep.cpu.extfeatures` lists your CPU's extensions (look for AVX2, BMI1, BMI2, FMA, F16C, AES, PCLMULQDQ, POPCNT and LZCNT).
+
 The script downloads the LLVM 20.1.8 source release from GitHub when `guestrt/src` lacks it, checks its SHA-256, builds arm64 libunwind, libc++abi and libc++, and copies them to `guestrt/lib`.
 [guestrt/BUILD.md](guestrt/BUILD.md) has the build configuration and the scripts that verify it.
+
+</details>
 
 ## Quick start
 
@@ -93,28 +96,59 @@ Three things to know before your own program:
 
 - **The first translation in a checkout is slower.** It builds the Swift signature database `sbt/swift_sigs.json` from the Swift corpus with `swiftc`; later translations reuse it, and compiled chunks are cached in `sbt/build/objcache`.
 - **Keep `out` where it is.** `translated` reads the guest images `out/image0.bin`, `out/image1.bin` and so on from their absolute paths each time it starts.
-- **`--ui-guard-off` is the only option.** It switches off the UI guard described under [Limits](#limits); any other `--` option is refused with the usage line.
+- **`--ui-guard-off` is the only option.** It switches off the UI guard described under [Limits](#limits), which an app with windows needs; any other `--` option is refused with the usage line.
 
-## Example: software that ships only for Apple silicon
+## What it runs
 
-Two programs with no Intel build to fall back on, both under licenses that allow translation, run on an Intel iMac (Core i9-10910).
+Four programs, each with a script under `examples/` that downloads its inputs at pinned hashes and checks the result.
+The numbers are from an Intel iMac (Core i9-10910, AMD Radeon Pro 5700).
 
-**LLVM's clang 23.** LLVM publishes its macOS release of clang 23.1.4 for Apple silicon only.
+- **[Hex](#hex-an-app-released-only-for-apple-silicon)**, a dictation app released for Apple silicon only, opens its windows and draws them.
+- **[LLVM's clang 23](#llvms-clang-23)**, released for Apple silicon only, builds SQLite with objects byte-identical to Apple silicon's.
+- **[SQLite](#sqlite-byte-for-byte)** gives byte-identical output to a native x86-64 build and runs SQLite's suite in 1.5 times the native time.
+- **[Apple's MLX](#apples-mlx)** trains a small network to the same loss and accuracy, digit for digit, as on Apple silicon.
+
+### Hex, an app released only for Apple silicon
+
+Hex 3.3.0 is an MIT-licensed dictation app; its official macOS release holds an arm64 executable only.
+[examples/hex/run.sh](examples/hex/run.sh) downloads that release at a pinned hash, translates its executable with `--ui-guard-off`, puts the translation in a copy of the app bundle, and runs it.
+
+<details>
+<summary>What the run shows</summary>
+
+- Hex starts its local API, its dictation and meeting workers and its update check, opens its main window and overlay panels, and draws its first-run screen (the image at the top) with the AMD GPU.
+- [examples/hex/framegrab.m](examples/hex/framegrab.m), loaded into the app, writes the first frame each of its Metal layers presents (up to eight) to a PNG. It reads the GPU texture, not the screen, so it needs no Screen Recording permission; that is where the image comes from.
+- The script passes when Hex is still running after `HEX_SECONDS` (30 by default) and one of its windows drew pixels.
+- A first translation takes about 45 minutes and 5.3 GB of memory on this Mac. It leaves 661 instructions Recask stops on if they run; none ran.
+- Dictation itself is not exercised.
+
+</details>
+
+### LLVM's clang 23
+
+LLVM publishes its macOS release of clang 23.1.4 for Apple silicon only.
 [examples/clang/run.sh](examples/clang/run.sh) downloads that release at a pinned hash, translates `clang-23`, and builds the SQLite 3.54.1 shell for x86-64 with it.
+
+<details>
+<summary>What the run shows</summary>
+
 The translation takes about 45 minutes and 24 GB of memory on this Mac, and leaves no instruction unsupported.
 
 - The `sqlite3` it builds gives the same output as one that Apple's native clang builds from the same preprocessed source, on suite.sql (in memory and on disk) and mandelbrot.sql.
 - From the same preprocessed source, the objects it writes are byte-identical to the ones clang 23 writes running natively on an Apple-silicon Mac. Run there, the script prints the hashes to compare.
 - It compiles `sqlite3.i` in 57 s on an otherwise idle iMac; Apple's native clang 17, a different version, takes 17 s.
 
-**Apple's MLX.** MLX supports Apple silicon only: its build refuses x86-64 macOS unless an opt-in flag forces it, and its Metal backend fails on this iMac's AMD GPU.
-[examples/mlx/run.sh](examples/mlx/run.sh) builds MLX 0.32.4 from Apple's source for arm64 with its CPU backend, translates [a program](examples/mlx/spiral.cpp) that trains a small network on a three-arm spiral, and compares its output with a run on an Apple-silicon Mac.
-Loss falls from 1.4647 to 0.1750 over 400 steps and accuracy reaches 0.9667, identical to the last printed digit; the translated run takes about 3 s.
-MLX's float16, float64 and complex kernels hold about 5,600 instructions Recask stops on; the program never reaches them.
+</details>
 
-## Example: SQLite on an Intel Mac
+### SQLite, byte for byte
 
-The SQLite 3.54.1 shell, built for arm64 only on an Apple-silicon Mac, translated and run on an Intel iMac (Core i9-10910).
+The SQLite 3.54.1 shell, built for arm64 only on an Apple-silicon Mac, refused by the Intel iMac, translated, and run:
+
+<p align="center"><img alt="On an Intel iMac: an arm64-only sqlite3 is refused with Bad CPU type, translated, then runs a Mandelbrot query" src="docs/demo/sqlite.gif" width="760"></p>
+
+<details>
+<summary>What the run shows</summary>
+
 The recording reuses compiled chunks from an earlier translation; a first translation of `sqlite3` takes about two minutes on this Mac.
 
 [examples/sqlite/run.sh](examples/sqlite/run.sh) repeats the comparison on any Intel Mac.
@@ -127,16 +161,18 @@ It downloads the SQLite amalgamation and `speedtest1.c` at pinned hashes, builds
 On the same Intel iMac, suite.sql takes 0.5 s as a native x86-64 build and 0.76 s translated (about 1.5 times as long), whether Apple clang 17 (what `run.sh` uses on an Intel Mac) or Apple clang 21 built the arm64 binary.
 With a profile from a run of speedtest1's SQL (`GDYLD_PGO`, [docs/environment.md](docs/environment.md)) and `GDYLD_LTO=thin`, it takes 0.68 s.
 
-<details>
-<summary>The features in full</summary>
+</details>
 
-- **Translated ahead of time** — each arm64 function becomes a C function over a CPU-state struct, and the output executes no arm64 code.
-- **The whole load graph** — the executable and the arm64 dylibs it links are translated into one `translated` executable; a dependency that has an x86-64 slice is used natively instead.
-- **Typed calls into macOS** — a call to a C function that the SDK headers declare is bridged from the Apple arm64 calling convention to the x86-64 one, with the types of its prototype; calls with special rules, such as `printf` or `objc_msgSend`, have hand-written bridges.
-- **Objective-C, blocks and Swift** — guest classes are registered with the host Objective-C runtime, guest blocks become host blocks, and Swift imports are bridged with signatures read from swiftc's own LLVM IR.
-- **C++ and its exceptions** — the C++ runtime a program links is replaced by arm64 builds of libc++, libc++abi and libunwind, translated with the program.
-- **Loud stops** — an instruction, import or control transfer it cannot translate stops the program with a `FATAL:` line on stderr and exit status 70. A few known gaps, such as a guest reading back a callback pointer it gave the host, change output instead; [docs/limits.md](docs/limits.md) lists them.
-- **Differential tests** — most test beds build each program for arm64 and x86-64 and compare the translated run with the native one.
+### Apple's MLX
+
+[examples/mlx/run.sh](examples/mlx/run.sh) builds MLX 0.32.4 from Apple's source for arm64 with its CPU backend, translates [a program](examples/mlx/spiral.cpp) that trains a small network on a three-arm spiral, and compares its output with a run on an Apple-silicon Mac.
+
+<details>
+<summary>What the run shows</summary>
+
+Loss falls from 1.4647 to 0.1750 over 400 steps and accuracy reaches 0.9667, identical to the last printed digit; the translated run takes about 3 s.
+MLX's float16, float64 and complex kernels hold about 5,600 instructions Recask stops on; the program never reaches them.
+This run shows correctness, not necessity: MLX's build refuses x86-64 macOS by default, but builds natively for it with `MLX_ENABLE_X64_MAC`, and its Metal backend fails on this iMac's AMD GPU.
 
 </details>
 
@@ -190,12 +226,10 @@ At start, `translated` maps the guest images at fixed addresses from `0x20000000
 
 ## Limits
 
-It is meant for arm64-only command-line programs: by default a translation is headless, and `--ui-guard-off` lets a translated app reach the window server and the GPU.
-
+- A translation is headless by default: AppKit, Metal and the window-server and display functions stop the program before they run. `--ui-guard-off` lets a translated app reach the window server and the GPU.
 - Only the executable and the arm64 dylibs it links are translated; `dlopen` of any other arm64 file returns `NULL`, and `dlerror()` says why.
 - Code the program generates while it runs is not translated; a branch outside the translated images and the known bridges stops with `FATAL: indirect branch to an unmapped target`.
 - SVE and SME instructions are lifted to a stop that fires only if one runs; other instructions with no lifter case are counted on the last line of `tools/translate.py`, which then exits 1.
-- With the UI guard on (the default), AppKit, Metal and the window-server and display functions stop the program before they run.
 - The input must be a thin arm64 Mach-O executable with an `LC_MAIN` entry point.
 
 [docs/limits.md](docs/limits.md) lists each stop with its message, and the extension points for host libraries outside the SDK.
@@ -219,7 +253,7 @@ Beds of your own go in `tools/beds_local.txt`, which git ignores.
 ## Debugging a translated program
 
 `translated` reads a few environment variables when it starts.
-`GDYLD_CRASH_TRACE=1` prints a host backtrace on a crash, `GDYLD_TRACE_IMPORTS=1` counts the calls to each host import, and `GDYLD_STOP_AT_IMPORT=name` stops the program before a named import runs.
+`GDYLD_CRASH_TRACE=1` prints a host backtrace on a crash or a loud stop, `GDYLD_TRACE_IMPORTS=1` counts the calls to each host import, and `GDYLD_STOP_AT_IMPORT=name` stops the program before a named import runs.
 [docs/environment.md](docs/environment.md) lists every variable the runtime and the translator read.
 
 ## Documentation

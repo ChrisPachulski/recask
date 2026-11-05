@@ -145,6 +145,8 @@ def one(case: dict) -> tuple[bool, str]:
     if ora is None:                                                    # the translation was never compared: a failure, not a skip
         return False, "  %-26s FAIL (oracle faulted, translation not checked)" % case["name"]
     oxs, osp, ofl, ov, omem = ora
+    spec = case.get("mem_spec", b"")                                   # memory from the ARM ARM where the oracle is known wrong
+    omem = spec + omem[len(spec):]
     nxs, nsp, nfl, nv, nmem = run_native(src, regs, case.get("mem", b""), case.get("vregs", {}))
     diffs = [("x%d" % i, hex(oxs[i]), hex(nxs[i])) for i in range(31) if oxs[i] != nxs[i]]
     if osp != nsp: diffs.append(("sp", hex(osp), hex(nsp)))

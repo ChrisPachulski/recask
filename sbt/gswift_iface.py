@@ -7,7 +7,7 @@ every Swift import the corpus database lacks, so the Swift beds run it."""
 # imports and constants
 ###############
 from __future__ import annotations
-import concurrent.futures, hashlib, os, re, subprocess
+import concurrent.futures, functools, hashlib, json, os, re, subprocess
 import gswift
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -372,17 +372,22 @@ def probe(g: dict, st: dict) -> str:
 ###############
 # compile and read the IR
 ###############
+@functools.lru_cache(maxsize=None)
+def probe_target(arch: str, sdk: str) -> str:
+    """The SDK's own version as the deployment target: a probe sees every declaration the SDK has, and a guest reaches the newer ones only behind its own availability checks."""
+    return "%s-apple-macos%s" % (arch, json.load(open(os.path.join(sdk, "SDKSettings.json")))["Version"])
+
 def compile_ir(src: str, arch: str, sdk: str) -> tuple[str | None, str]:
-    """(IR text or None, compiler errors) of one probe source for one arch; cached by content."""
+    """(IR text or None, compiler errors) of one probe source for one arch; cached by content and target."""
     os.makedirs(CACHE, exist_ok=True)
-    key = hashlib.sha256((src + arch + sdk).encode()).hexdigest()[:24]
+    key = hashlib.sha256((src + probe_target(arch, sdk) + sdk).encode()).hexdigest()[:24]
     out, path = os.path.join(CACHE, key + ".ll"), os.path.join(CACHE, key + ".swift")
     if os.path.isfile(out): return open(out).read(), ""
     if os.path.isfile(out + ".err"): return None, open(out + ".err").read()
     tmp = ".%d.tmp" % os.getpid()                              # per process: parallel beds share this cache
     open(path + tmp, "w").write(src)
     os.replace(path + tmp, path)                               # never truncated under another process's swiftc
-    r = subprocess.run(["xcrun", "swiftc", "-target", gswift.TARGET % arch, "-sdk", sdk, "-emit-ir"] + gswift.swiftc_flags(path) + [path, "-o", out + tmp],
+    r = subprocess.run(["xcrun", "swiftc", "-target", probe_target(arch, sdk), "-sdk", sdk, "-emit-ir"] + gswift.swiftc_flags(path) + [path, "-o", out + tmp],
                        capture_output=True, text=True, timeout=600)
     if r.returncode: open(out + ".err", "w").write(r.stderr); return None, r.stderr
     os.replace(out + tmp, out)
